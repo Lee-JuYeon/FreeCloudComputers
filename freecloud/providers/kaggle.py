@@ -1,7 +1,8 @@
 """kaggle 어댑터 — kaggle CLI(kernels push/status/output)로 무인 실행.
 
-중요 제약(설계): Kaggle **API/CLI는 단일 GPU만** 노출한다(보통 P100 또는 T4×1).
-  T4×2 는 웹 UI 전용 → 헤드리스 오케스트레이터에선 못 씀. capabilities에 명시.
+중요 제약(설계): Kaggle **API/CLI는 단일 GPU만** 노출한다(기본 P100).
+  T4×2 는 웹 UI 전용 → 헤드리스 API로는 못 고른다. 완전 무인 T4×2가 필요하면
+  KaggleUIProvider(name="kaggle-ui", Playwright)를 쓴다 — 이 클래스의 헬퍼를 재사용.
 쿼터 ~30 GPU-h/주. 출력이 /kaggle/working 에 영속 → 웹소켓 끊김 레이스 없음(안정적).
 Windows cp949 회피 위해 PYTHONUTF8=1 강제(Infopu E4 교훈).
 """
@@ -9,7 +10,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
+import time
 
 from ..job import Job
 from ..errors import classify
@@ -20,9 +23,10 @@ _UTF8 = {"PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
 
 class KaggleProvider(Provider):
     name = "kaggle"
-    capabilities = {"gpu": "P100|T4x1", "vram_gb": 16, "headless": True,
-                    "note": "API는 단일 GPU만. T4x2는 UI 전용."}
+    capabilities = {"gpu": "P100", "vram_gb": 16, "headless": True,
+                    "note": "API는 단일 GPU(기본 P100). T4x2는 kaggle-ui(Playwright)로."}
 
+    # ── 공용 헬퍼(kaggle-ui가 재사용) ────────────────────────────────────────
     def _user(self) -> str:
         if os.environ.get("KAGGLE_USERNAME"):
             return os.environ["KAGGLE_USERNAME"]
@@ -34,6 +38,72 @@ class KaggleProvider(Provider):
                 pass
         return ""
 
+    def kernel_slug(self, job: Job) -> str:
+        return f"freecloud-{job.name}".lower().replace("_", "-")[:50]
+
+    def kernel_id(self, job: Job) -> str:
+        return f"{self._user()}/{self.kernel_slug(job)}"
+
+    def _write_kernel_dir(self, job: Job) -> str:
+        """work 디렉터리에 kernel.py + kernel-metadata.json 생성 → 경로 반환."""
+        work = tempfile.mkdtemp(prefix="fc-kaggle-")
+        with open(os.path.join(work, "kernel.py"), "w", encoding="utf-8") as f:
+            f.write(_KERNEL_WRAPPER.format(entrypoint=job.entrypoint))
+        meta = {
+            "id": self.kernel_id(job), "title": self.kernel_slug(job),
+            "code_file": "kernel.py", "language": "python", "kernel_type": "script",
+            "enable_gpu": True, "enable_internet": True,
+            "dataset_sources": [], "kernel_sources": [], "competition_sources": [],
+        }
+        with open(os.path.join(work, "kernel-metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        return work
+
+    def _push(self, work: str, job: Job) -> tuple[int, str]:
+        env = {**_UTF8, **job.resolved_env()}
+        return self._sh(["kaggle", "kernels", "push", "-p", work], 300, env)
+
+    def _read_diag(self, kernel_id: str, work: str) -> str:
+        out = os.path.join(work, "out")
+        self._sh(["kaggle", "kernels", "output", kernel_id, "-p", out], 180, _UTF8)
+        dp = os.path.join(out, "diag.txt")
+        return open(dp, encoding="utf-8", errors="replace").read() if os.path.exists(dp) else ""
+
+    @staticmethod
+    def assigned_gpu(diag: str) -> str:
+        """kernel 래퍼가 diag에 남긴 nvidia-smi -L 파싱 → 'Tesla P100' / 'Tesla T4' 등."""
+        m = re.findall(r"(Tesla \w+|A100\w*|L4|T4)", diag or "")
+        if not m:
+            return ""
+        # T4가 2줄이면 T4x2로 표기
+        if m.count("T4") >= 2 or diag.count("Tesla T4") >= 2:
+            return "T4x2"
+        return m[0]
+
+    def _poll_and_fetch(self, job: Job, work: str) -> RunResult:
+        kid = self.kernel_id(job)
+        deadline = time.time() + job.max_runtime_s
+        while time.time() < deadline:
+            time.sleep(60)
+            rc, st = self._sh(["kaggle", "kernels", "status", kid], 60, _UTF8)
+            low = st.lower()
+            if "complete" in low:
+                diag = self._read_diag(kid, work)
+                got = self.assigned_gpu(diag)
+                want = job.needs.get("gpu")
+                if want and got and want.lower() != got.lower():
+                    return RunResult(False, "needs_setup",
+                                     f"요청={want} 인데 실제={got}. UI에서 가속기 재설정 필요.",
+                                     diag[-600:], "GPU_MISMATCH")
+                return RunResult(True, "done", f"Kaggle 완료(GPU={got or '?'}).", st[-400:])
+            if "error" in low:
+                diag = self._read_diag(kid, work)
+                d = classify(st + "\n" + diag)
+                return RunResult(False, "error", d.advice, (diag or st)[-1200:], d.error_class)
+        return RunResult(False, "timeout", f"Kaggle 폴링 {job.max_runtime_s}s 초과.",
+                         error_class="TIMEOUT")
+
+    # ── 인터페이스 ───────────────────────────────────────────────────────────
     def probe(self) -> Probe:
         if not self._user():
             return Probe(False, "~/.kaggle/kaggle.json 없음(KAGGLE_USERNAME 미설정).")
@@ -43,62 +113,23 @@ class KaggleProvider(Provider):
         return Probe(True, "kaggle 인증 OK.")
 
     def run(self, job: Job) -> RunResult:
-        user = self._user()
-        if not user:
+        if not self._user():
             return RunResult(False, "error", "Kaggle 인증 없음.", error_class="AUTH")
-
-        slug = f"freecloud-{job.name}".lower().replace("_", "-")[:50]
-        kernel_id = f"{user}/{slug}"
-        work = tempfile.mkdtemp(prefix="fc-kaggle-")
-        # entrypoint를 감싸는 커널 스크립트(체크포인트 pull/push는 entrypoint 책임).
-        script = os.path.join(work, "kernel.py")
-        with open(script, "w", encoding="utf-8") as f:
-            f.write(_KERNEL_WRAPPER.format(entrypoint=job.entrypoint))
-        meta = {
-            "id": kernel_id, "title": slug, "code_file": "kernel.py",
-            "language": "python", "kernel_type": "script",
-            "enable_gpu": True, "enable_internet": True,   # 단일 GPU만 붙음(설계 제약)
-            "dataset_sources": [], "kernel_sources": [],
-        }
-        with open(os.path.join(work, "kernel-metadata.json"), "w", encoding="utf-8") as f:
-            json.dump(meta, f)
-
-        env = {**_UTF8, **job.resolved_env()}
-        rc, log = self._sh(["kaggle", "kernels", "push", "-p", work], 300, env)
+        work = self._write_kernel_dir(job)
+        rc, log = self._push(work, job)
         if rc != 0:
             d = classify(log)
             return RunResult(False, "error", d.advice, log[-1200:], d.error_class)
-
-        # 폴링: kaggle kernels status → complete/error/running.
-        import time
-        deadline = time.time() + job.max_runtime_s
-        while time.time() < deadline:
-            time.sleep(60)
-            rc, st = self._sh(["kaggle", "kernels", "status", kernel_id], 60, _UTF8)
-            low = st.lower()
-            if "complete" in low:
-                out = os.path.join(work, "out")
-                self._sh(["kaggle", "kernels", "output", kernel_id, "-p", out], 180, _UTF8)
-                return RunResult(True, "done", "Kaggle 커널 완료.", st[-400:])
-            if "error" in low:
-                # 커널 내부 diag 회수해 정밀 분류
-                out = os.path.join(work, "out")
-                self._sh(["kaggle", "kernels", "output", kernel_id, "-p", out], 120, _UTF8)
-                diag = ""
-                dp = os.path.join(out, "diag.txt")
-                if os.path.exists(dp):
-                    diag = open(dp, encoding="utf-8", errors="replace").read()
-                d = classify(st + "\n" + diag)
-                return RunResult(False, "error", d.advice, (diag or st)[-1200:], d.error_class)
-        return RunResult(False, "timeout", f"Kaggle 폴링 {job.max_runtime_s}s 초과.",
-                         error_class="TIMEOUT")
+        return self._poll_and_fetch(job, work)
 
 
-# 커널 안에서 실행되는 래퍼: 진단 파일(diag.txt) 남겨 실패 분류를 돕는다.
-_KERNEL_WRAPPER = '''import subprocess, sys, traceback
+# 커널 안에서 실행되는 래퍼: 실제 GPU(nvidia-smi)와 예외를 diag.txt에 남겨 분류/검증을 돕는다.
+_KERNEL_WRAPPER = '''import subprocess, traceback
+open("/kaggle/working/diag.txt", "w").write("boot\\n")
 try:
+    subprocess.run("nvidia-smi -L >> /kaggle/working/diag.txt 2>&1", shell=True)
     subprocess.run({entrypoint!r}, shell=True, check=True)
-except Exception as e:
-    open("/kaggle/working/diag.txt","w").write("".join(traceback.format_exc()))
+except Exception:
+    open("/kaggle/working/diag.txt", "a").write(traceback.format_exc())
     raise
 '''

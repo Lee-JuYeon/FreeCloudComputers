@@ -19,6 +19,7 @@ dependencies = [
 # provider CLIs are invoked as subprocesses; install what you use.
 hub = ["huggingface_hub>=0.23"]     # 체크포인트 동기화 저장소(기본)
 mcp = ["mcp>=1.0"]                   # 선택: Claude/dev-hub 제어용 MCP 래퍼
+kaggle-ui = ["playwright>=1.40"]    # 선택: Kaggle T4x2 UI 자동화(playwright install chromium 필요)
 dev = ["pytest>=7"]
 
 [project.scripts]

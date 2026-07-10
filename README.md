@@ -54,6 +54,7 @@ job.yaml ─► orchestrator ─► [provider 순회: probe→run→성공?]
 |---|---|
 | `providers/base.py` | 어댑터 인터페이스(`probe`/`run`/`fits`). 새 클라우드 = 파일 하나 + registry 한 줄 |
 | `providers/{kaggle,colab,lightning,modal}.py` | 4개 구현. Kaggle/Colab은 검증된 페일오버 로직 이식 |
+| `providers/kaggle_ui.py` | T4×2 전용 — Playwright로 UI 자동화(opt-in, `kaggle-login` 선행) |
 | `checkpoint.py` | 재개의 린치핀. HF Hub에 상태 push/pull |
 | `errors.py` | 중앙 오류 플레이북(단일 SSOT). 오류→행동 매핑 |
 | `state.py` | 쿨다운 영속화(죽은 provider 계속 두드리지 않게) |
@@ -87,10 +88,23 @@ job.yaml ─► orchestrator ─► [provider 순회: probe→run→성공?]
 | ⚙ | Oracle Always Free | ARM A1 | 영구(컨트롤 플레인) | 필요 |
 | ⚙ | GitHub Actions | CPU | 2000분/월(디스패처) | X |
 
-### Kaggle T4×2 주의
-Kaggle **API/CLI는 단일 GPU만** 노출한다(보통 P100 또는 T4×1). **T4×2는 웹 UI 전용**이라
-헤드리스 오케스트레이터에선 못 쓴다. UI에서 T4×2가 회색이면: ①전화번호 인증 ②주간 쿼터 소진
-③남의 노트북 Viewer(→Copy&Edit) ④세션 running 중(→Stop) 순으로 점검.
+### Kaggle T4×2 — provider `kaggle-ui` (Playwright 자동화)
+Kaggle **API/CLI는 단일 GPU(P100)만** 노출한다. **T4×2는 웹 UI 전용**(Settings→Accelerator→
+GPU T4 x2→Save & Run All). `freecloud`는 이걸 `kaggle-ui` provider로 자동화한다:
+
+```bash
+pip install -e '.[kaggle-ui]' && playwright install chromium
+freecloud kaggle-login          # 최초 1회: 브라우저 로그인(2FA 포함) → 세션 저장
+# job.yaml 의 providers 에 kaggle-ui 추가 → 무인 T4×2
+```
+
+동작: 코드 push → Playwright가 로그인 상태로 에디터를 열어 T4×2 선택 + Save & Run All →
+커널 안 `nvidia-smi -L` 로 **실제 T4×2 붙었는지 검증**(불일치면 `needs_setup` 반환).
+셀렉터는 Kaggle 에디터 DOM 기준 best-effort — UI 바뀌면 `providers/kaggle_ui.py` 조정.
+디버그: `FREECLOUD_KAGGLE_HEADFUL=1` 로 브라우저 띄워 확인.
+
+> UI에서 T4×2가 회색이면(수동 점검): ①전화번호 인증 ②주간 쿼터 소진 ③남의 노트북
+> Viewer(→Copy&Edit) ④세션 running 중(→Stop).
 
 ## 새 provider 추가
 

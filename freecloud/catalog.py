@@ -8,7 +8,7 @@ from __future__ import annotations
 CATALOG = [
     # name, gpu, free_limit, credit_card, status, note
     ("Kaggle",              "P100 / T4x2 / TPU v5e-8", "~30 GPU-h/주, 세션 12h", "no",  "adapter",
-     "API/CLI는 단일 GPU만(T4x2는 UI 전용). 출력 /kaggle/working 영속 → 안정적."),
+     "API=단일 P100. T4x2는 provider 'kaggle-ui'(Playwright 자동화)로. 출력 /kaggle/working 영속."),
     ("Google Colab",        "T4 16GB",                 "~15-30 GPU-h/주(변동)",  "no",  "adapter",
      "무료=계정당 GPU 동시 1개. 90분 유휴 끊김, 세션 최대 12h."),
     ("Lightning AI",        "L4 / T4",                 "15크레딧/월 ≈ 80 GPU-h", "no",  "adapter",

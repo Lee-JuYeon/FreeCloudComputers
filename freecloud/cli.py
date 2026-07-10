@@ -55,6 +55,13 @@ def _cmd_clouds(args) -> int:
     return 0
 
 
+def _cmd_kaggle_login(args) -> int:
+    """Kaggle 로그인 상태 저장(kaggle-ui/T4x2 자동화 선행 1회)."""
+    from .providers.kaggle_ui import save_login_state
+    save_login_state()
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="freecloud",
                                  description="무료(비중국) 클라우드 GPU 페일오버 오케스트레이터")
@@ -71,6 +78,8 @@ def main(argv=None) -> int:
     sub.add_parser("providers", help="provider probe 상태").set_defaults(fn=_cmd_providers)
     sub.add_parser("status", help="쿨다운 스냅샷").set_defaults(fn=_cmd_status)
     sub.add_parser("clouds", help="무료 클라우드 카탈로그").set_defaults(fn=_cmd_clouds)
+    sub.add_parser("kaggle-login", help="Kaggle 로그인 저장(kaggle-ui/T4x2용, 1회)"
+                   ).set_defaults(fn=_cmd_kaggle_login)
 
     args = ap.parse_args(argv)
     return args.fn(args)

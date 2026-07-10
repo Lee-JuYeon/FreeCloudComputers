@@ -7,17 +7,20 @@ from __future__ import annotations
 
 from .providers.base import Provider
 from .providers.kaggle import KaggleProvider
+from .providers.kaggle_ui import KaggleUIProvider
 from .providers.colab import ColabProvider
 from .providers.modal import ModalProvider
 from .providers.lightning import LightningProvider
 
 _FACTORIES = {
     "lightning": LightningProvider,
-    "kaggle": KaggleProvider,
+    "kaggle": KaggleProvider,       # API, 단일 GPU(P100)
+    "kaggle-ui": KaggleUIProvider,  # Playwright, T4x2(opt-in: kaggle-login 선행)
     "colab": ColabProvider,
     "modal": ModalProvider,
 }
 
+# 기본 순서에 kaggle-ui는 제외(로그인 세팅 필요) — job.providers로 opt-in.
 DEFAULT_ORDER = ["lightning", "kaggle", "colab", "modal"]
 
 
