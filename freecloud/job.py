@@ -23,7 +23,8 @@ class Job:
     checkpoint_repo: str = ""             # HF Hub repo id — 재개 상태 저장소(예: "user/myjob-ckpt")
     artifacts: list[str] = field(default_factory=list)  # 회수할 원격 경로들
     needs: dict[str, Any] = field(default_factory=dict) # {gpu, min_vram_gb, ...} — provider 필터
-    env: dict[str, str] = field(default_factory=dict)   # 원격에 주입할 env
+    env: dict[str, str] = field(default_factory=dict)   # 원격에 주입할 비밀 아닌 env
+    secrets: list[str] = field(default_factory=list)    # 원격에 주입할 시크릿 이름(값은 저장소/env에서)
     max_runtime_s: int = 5400             # 단일 노드 최대 실행(무료 세션 한도 안쪽)
     providers: list[str] = field(default_factory=list)  # 시도 순서. 비면 registry 기본순.
     success_glob: str = ""                # 성공 판정용 산출물 패턴(mtime 갱신 = 성공)
@@ -41,8 +42,14 @@ class Job:
         return job
 
     def resolved_env(self) -> dict[str, str]:
-        """원격에 주입할 env. checkpoint 재개에 필요한 것들을 자동 포함."""
+        """원격에 주입할 env = 비밀아닌 env + 필요한 시크릿(HF_TOKEN 등) 자동 주입.
+
+        시크릿은 저장소/환경변수에서 값을 끌어와 원격 노드로 실어보낸다(secrets.collect_for_job).
+        그래서 job.yaml에 토큰을 적지 않아도 체크포인트 push/pull이 원격에서 동작한다.
+        """
         e = dict(self.env)
         if self.checkpoint_repo:
             e.setdefault("FREECLOUD_CKPT_REPO", self.checkpoint_repo)
+        from . import secrets  # 지연 import(순환 회피)
+        e.update(secrets.collect_for_job(self))
         return e

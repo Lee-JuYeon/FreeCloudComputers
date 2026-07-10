@@ -1,0 +1,35 @@
+# 예시: 무인 디스패처 — GitHub Actions를 컨트롤 플레인으로 써서 freecloud를 주기 실행.
+# 토큰 방식 provider(kaggle/modal/lightning/saturn/HF)만 CI에서 무인 동작한다.
+# 브라우저 방식(colab/kaggle-ui)은 저장된 storage_state가 필요 → CI에선 제한적.
+#
+# 쓰려면: 이 파일을 dispatch.yml 로 복사하고, 아래 secrets를 레포 Settings→Secrets 에 등록.
+#   HF_TOKEN, KAGGLE_USERNAME, KAGGLE_KEY, MODAL_TOKEN_ID, MODAL_TOKEN_SECRET,
+#   LIGHTNING_USER_ID, LIGHTNING_API_KEY, LIGHTNING_TEAMSPACE, SATURN_TOKEN
+name: freecloud-dispatch (example)
+
+on:
+  workflow_dispatch: {}        # 수동 실행
+  schedule:
+    - cron: "0 */6 * * *"      # 6시간마다 (쿼터 리셋 맞춰 조정)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -e '.[hub]' && pip install kaggle modal
+      - name: Run job with failover
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+          KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          LIGHTNING_USER_ID: ${{ secrets.LIGHTNING_USER_ID }}
+          LIGHTNING_API_KEY: ${{ secrets.LIGHTNING_API_KEY }}
+          LIGHTNING_TEAMSPACE: ${{ secrets.LIGHTNING_TEAMSPACE }}
+          SATURN_TOKEN: ${{ secrets.SATURN_TOKEN }}
+        run: freecloud run examples/job.yaml --providers kaggle,modal,lightning,saturn

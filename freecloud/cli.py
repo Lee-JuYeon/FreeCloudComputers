@@ -20,11 +20,15 @@ def _cmd_run(args) -> int:
     job = Job.load(args.job)
     if args.providers:
         job.providers = [p.strip() for p in args.providers.split(",") if p.strip()]
+    order = job.providers or registry.DEFAULT_ORDER
     if args.dry_run:
-        print(json.dumps({"job": job.name, "providers": job.providers or registry.DEFAULT_ORDER,
+        print(json.dumps({"job": job.name, "providers": order,
                           "checkpoint_repo": job.checkpoint_repo,
                           "max_runtime_s": job.max_runtime_s}, ensure_ascii=False, indent=2))
         return 0
+    if not args.no_interactive:
+        from . import auth
+        auth.ensure_for_job(job, order, interactive=True)  # cloudflare 스타일 온디맨드 로그인
     result = orchestrator.run(job, once=args.once, max_rounds=args.rounds)
     print("\n===== RESULT =====")
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -62,6 +66,25 @@ def _cmd_kaggle_login(args) -> int:
     return 0
 
 
+def _cmd_login(args) -> int:
+    """freecloud login <provider> — 사이트별 최초 1회 로그인/토큰 등록."""
+    from . import auth
+    auth.login(args.provider)
+    return 0
+
+
+def _cmd_auth(args) -> int:
+    """freecloud auth — 모든 인증 상태(계정/토큰/세션) 한눈에."""
+    from . import auth, secrets
+    for s in auth.status_all():
+        mark = "OK " if s.ok else "-- "
+        print(f"{mark}{s.provider:12} {s.detail}")
+    stored = secrets.names()
+    if stored:
+        print("\n저장된 시크릿(이름만):", ", ".join(stored))
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="freecloud",
                                  description="무료(비중국) 클라우드 GPU 페일오버 오케스트레이터")
@@ -73,6 +96,8 @@ def main(argv=None) -> int:
     r.add_argument("--providers", help="시도 순서 덮어쓰기(쉼표)")
     r.add_argument("--rounds", type=int, default=3, help="전체 순회 최대 라운드")
     r.add_argument("--dry-run", action="store_true", help="계획만 출력")
+    r.add_argument("--no-interactive", action="store_true",
+                   help="온디맨드 로그인 프롬프트 끔(CI/무인)")
     r.set_defaults(fn=_cmd_run)
 
     sub.add_parser("providers", help="provider probe 상태").set_defaults(fn=_cmd_providers)
@@ -80,6 +105,12 @@ def main(argv=None) -> int:
     sub.add_parser("clouds", help="무료 클라우드 카탈로그").set_defaults(fn=_cmd_clouds)
     sub.add_parser("kaggle-login", help="Kaggle 로그인 저장(kaggle-ui/T4x2용, 1회)"
                    ).set_defaults(fn=_cmd_kaggle_login)
+
+    lg = sub.add_parser("login", help="provider 로그인/토큰 등록(1회)")
+    lg.add_argument("provider", help="huggingface|kaggle|colab|modal|lightning|saturn|kaggle-ui")
+    lg.set_defaults(fn=_cmd_login)
+
+    sub.add_parser("auth", help="인증 상태 한눈에").set_defaults(fn=_cmd_auth)
 
     args = ap.parse_args(argv)
     return args.fn(args)
