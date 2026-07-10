@@ -1,0 +1,34 @@
+# 예시 job — LoRA 학습을 무료 클라우드 풀에서 페일오버 실행.
+# freecloud run examples/job.yaml
+name: demo-lora
+
+# 원격 노드에서 실행할 명령. 코드가 repo에 있거나 workdir로 업로드된다는 전제.
+# entrypoint 는 시작 시 체크포인트를 pull, N스텝마다 push 해야 재개가 성립한다(train_lora.py 참고).
+entrypoint: "pip install -q freecloud huggingface_hub && python train_lora.py"
+
+# 코드 소스(둘 중 하나). git repo 우선, 없으면 workdir 업로드.
+repo: ""
+workdir: "."
+
+# ★ 재개의 핵심 — 모든 provider가 공유하는 상태 저장소(HF Hub repo id).
+# 비우면 페일오버 시 처음부터 다시 학습한다. 반드시 채우는 걸 권장.
+checkpoint_repo: "your-hf-username/demo-lora-ckpt"
+
+# 회수할 원격 산출물 경로(colab 등 비영속 노드용).
+artifacts:
+  - "/content/ckpt"
+
+# provider 필터. 못 맞추는 provider는 자동 스킵.
+needs:
+  gpu: "T4"
+  min_vram_gb: 16
+  headless: true
+
+# 원격에 주입할 env. HF_TOKEN 등 비밀은 여기 넣지 말고 provider Secret/로컬 env로.
+env:
+  EPOCHS: "3"
+
+max_runtime_s: 5400          # 단일 노드 한도(무료 세션 안쪽). 초과 전 체크포인트 남기고 페일오버.
+
+# 시도 순서(비우면 기본: lightning,kaggle,colab,modal).
+providers: [lightning, kaggle, colab, modal]

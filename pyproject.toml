@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "freecloud"
+version = "0.1.0"
+description = "Pool free (non-China) cloud GPUs — run a checkpoint-resumable job and auto-failover to the next provider when quota runs out."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Lee-JuYeon" }]
+keywords = ["gpu", "colab", "kaggle", "modal", "lightning", "failover", "free-tier", "orchestration"]
+dependencies = [
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# provider CLIs are invoked as subprocesses; install what you use.
+hub = ["huggingface_hub>=0.23"]     # 체크포인트 동기화 저장소(기본)
+mcp = ["mcp>=1.0"]                   # 선택: Claude/dev-hub 제어용 MCP 래퍼
+dev = ["pytest>=7"]
+
+[project.scripts]
+freecloud = "freecloud.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Lee-JuYeon/FreeCloudComputers"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["freecloud*"]
