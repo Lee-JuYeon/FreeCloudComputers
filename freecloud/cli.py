@@ -20,11 +20,15 @@ def _cmd_run(args) -> int:
     job = Job.load(args.job)
     if args.providers:
         job.providers = [p.strip() for p in args.providers.split(",") if p.strip()]
+    order = job.providers or registry.DEFAULT_ORDER
     if args.dry_run:
-        print(json.dumps({"job": job.name, "providers": job.providers or registry.DEFAULT_ORDER,
+        print(json.dumps({"job": job.name, "providers": order,
                           "checkpoint_repo": job.checkpoint_repo,
                           "max_runtime_s": job.max_runtime_s}, ensure_ascii=False, indent=2))
         return 0
+    if not args.no_interactive:
+        from . import auth
+        auth.ensure_for_job(job, order, interactive=True)  # cloudflare 스타일 온디맨드 로그인
     result = orchestrator.run(job, once=args.once, max_rounds=args.rounds)
     print("\n===== RESULT =====")
     print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -92,6 +96,8 @@ def main(argv=None) -> int:
     r.add_argument("--providers", help="시도 순서 덮어쓰기(쉼표)")
     r.add_argument("--rounds", type=int, default=3, help="전체 순회 최대 라운드")
     r.add_argument("--dry-run", action="store_true", help="계획만 출력")
+    r.add_argument("--no-interactive", action="store_true",
+                   help="온디맨드 로그인 프롬프트 끔(CI/무인)")
     r.set_defaults(fn=_cmd_run)
 
     sub.add_parser("providers", help="provider probe 상태").set_defaults(fn=_cmd_providers)

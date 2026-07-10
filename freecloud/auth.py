@@ -145,6 +145,50 @@ def login(provider: str) -> None:
     fn()
 
 
+def interactive_available() -> bool:
+    """TTY면 대화형 로그인 유도 가능(CI/파이프에선 False)."""
+    import sys
+    try:
+        return sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def ensure_for_job(job, order, interactive: bool = True) -> None:
+    """Cloudflare CLI 스타일 온디맨드 인증 — 실행 전에 필요한 로그인을 그 자리에서 유도.
+
+    - job.checkpoint_repo 있으면 HF 토큰 유효성 확인 → 없/무효면 즉석 로그인.
+    - 시도할 provider들이 미인증이면 지금 로그인할지 물어봄.
+    비대화형(CI)에선 경고만 출력하고 진행.
+    """
+    can = interactive and interactive_available()
+
+    if getattr(job, "checkpoint_repo", ""):
+        st = _hf_whoami()
+        if not st.ok:
+            if can:
+                print(f"\n▶ 체크포인트 저장소({job.checkpoint_repo})에 HF 토큰이 필요합니다. ({st.detail})")
+                login_huggingface()
+            else:
+                print(f"⚠ HF 토큰 없음/무효({st.detail}) — 체크포인트 재개가 동작하지 않을 수 있음.")
+
+    from . import registry
+    for name in order:
+        try:
+            prov = registry.get(name)
+        except Exception:
+            continue
+        pr = prov.probe()
+        if pr.available:
+            continue
+        if can and name in _HANDLERS:
+            ans = input(f"\n▶ [{name}] 사용불가: {pr.reason}\n  지금 로그인/설정할까요? [y/N] ").strip().lower()
+            if ans == "y":
+                login(name)
+        else:
+            print(f"⚠ [{name}] {pr.reason} (스킵됨)")
+
+
 def _prompt_secret(prompt: str) -> str:
     """터미널에서 시크릿 입력(가능하면 에코 없이)."""
     try:

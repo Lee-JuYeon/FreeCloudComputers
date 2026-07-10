@@ -1,0 +1,10 @@
+# 라이브 스모크 — Kaggle API 경로(push→poll→fetch→nvidia-smi 검증) e2e.
+# 체크포인트 없음 → HF 토큰 불필요. GPU 붙는지/커널 완주하는지만 확인.
+name: smoke-kaggle
+entrypoint: "nvidia-smi -L && python -c \"print('hello from freecloud kaggle')\""
+checkpoint_repo: ""
+needs:
+  gpu: "P100"
+  headless: true
+max_runtime_s: 1800
+providers: [kaggle]
