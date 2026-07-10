@@ -24,10 +24,20 @@ pip install -e '.[mcp]'     # + Claude/dev-hub 제어용 MCP 래퍼(선택)
 
 ```bash
 freecloud clouds              # 지원/후보 무료 클라우드 카탈로그
-freecloud providers           # 내 환경에서 각 provider 인증/가용 상태
+freecloud login huggingface   # 체크포인트 저장소 토큰(재개에 필요) — 자세히는 docs/AUTH.md
+freecloud login kaggle        # 사이트별 로그인은 처음 한 번만
+freecloud auth                # 인증 상태 한눈에(계정/토큰/세션)
+freecloud providers           # 각 provider 가용 상태
 freecloud run examples/job.yaml
 freecloud status              # provider별 쿨다운 스냅샷
 ```
+
+## 로그인/토큰 (처음 한 번만)
+
+로그인은 두 종류뿐 — **토큰 붙여넣기**(huggingface/kaggle/modal/lightning/saturn)와
+**브라우저 로그인**(colab/kaggle-ui, 구글 OAuth는 자동화 불가라 headful 1회 → 쿠키 재사용).
+등록만 하면 **freecloud가 HF 토큰을 Kaggle 커널 등 원격 노드에 자동 주입**하므로 job.yaml에
+토큰을 적지 않아도 체크포인트가 동작합니다. 상세 → **[docs/AUTH.md](docs/AUTH.md)**.
 
 `job.yaml` 한 장으로 정의(→ `examples/job.yaml`):
 
@@ -55,7 +65,9 @@ job.yaml ─► orchestrator ─► [provider 순회: probe→run→성공?]
 | `providers/base.py` | 어댑터 인터페이스(`probe`/`run`/`fits`). 새 클라우드 = 파일 하나 + registry 한 줄 |
 | `providers/{kaggle,colab,lightning,modal}.py` | 4개 구현. Kaggle/Colab은 검증된 페일오버 로직 이식 |
 | `providers/kaggle_ui.py` | T4×2 전용 — Playwright로 UI 자동화(opt-in, `kaggle-login` 선행) |
+| `providers/saturn.py` | Saturn Cloud(saturn-client recipe) |
 | `checkpoint.py` | 재개의 린치핀. HF Hub에 상태 push/pull |
+| `auth.py` / `secrets.py` | 통합 로그인/인증 상태 + 시크릿 저장·원격 자동주입 |
 | `errors.py` | 중앙 오류 플레이북(단일 SSOT). 오류→행동 매핑 |
 | `state.py` | 쿨다운 영속화(죽은 provider 계속 두드리지 않게) |
 | `orchestrator.py` | 페일오버 루프 |
@@ -79,7 +91,7 @@ job.yaml ─► orchestrator ─► [provider 순회: probe→run→성공?]
 | ✓ | Colab | T4 16GB | ~15–30h/주 | X |
 | ✓ | Lightning AI | L4/T4 | 15크레딧/월 ≈ 80h | X |
 | ✓ | Modal | T4/L4/A10G | ~$30/월 | X |
-| · | Saturn Cloud | T4 | 반복 무료 | X |
+| ✓ | Saturn Cloud | T4 | 반복 무료 | X |
 | · | SageMaker Studio Lab | T4 | 4h/세션 · ⚠️ 신규가입 2026-07-30 마감 | X |
 | · | Intel Tiber AI Cloud | Gaudi2 / GPU Max | 무료 | X |
 | · | HF Spaces ZeroGPU | H200(버스트) | ~5분/일 (데모용) | X |

@@ -11,6 +11,7 @@ from .providers.kaggle_ui import KaggleUIProvider
 from .providers.colab import ColabProvider
 from .providers.modal import ModalProvider
 from .providers.lightning import LightningProvider
+from .providers.saturn import SaturnProvider
 
 _FACTORIES = {
     "lightning": LightningProvider,
@@ -18,6 +19,7 @@ _FACTORIES = {
     "kaggle-ui": KaggleUIProvider,  # Playwright, T4x2(opt-in: kaggle-login 선행)
     "colab": ColabProvider,
     "modal": ModalProvider,
+    "saturn": SaturnProvider,
 }
 
 # 기본 순서에 kaggle-ui는 제외(로그인 세팅 필요) — job.providers로 opt-in.
