@@ -76,14 +76,20 @@ class KaggleProvider(Provider):
 
     @staticmethod
     def assigned_gpu(diag: str) -> str:
-        """kernel 래퍼가 diag에 남긴 nvidia-smi -L 파싱 → 'Tesla P100' / 'Tesla T4' 등."""
-        m = re.findall(r"(Tesla \w+|A100\w*|L4|T4)", diag or "")
-        if not m:
+        """nvidia-smi -L 파싱 → 짧은 정규화 코드('P100'/'T4'/'T4x2'/'A100'…). 없으면 ''."""
+        models = re.findall(r"(P100|V100|A100|A10G|L40S|L40|L4|T4)", diag or "")
+        if not models:
             return ""
-        # T4가 2줄이면 T4x2로 표기
-        if m.count("T4") >= 2 or diag.count("Tesla T4") >= 2:
+        if models.count("T4") >= 2:      # T4가 2개 = T4x2
             return "T4x2"
-        return m[0]
+        return models[0]
+
+    @staticmethod
+    def _gpu_matches(want: str, got: str) -> bool:
+        """요청 GPU와 실제 GPU가 호환되는지(부분일치). 'P100'~'Tesla P100', 'T4'~'T4x2' 등."""
+        w = (want or "").lower().replace(" ", "").replace("-", "")
+        g = (got or "").lower().replace(" ", "").replace("-", "")
+        return not w or not g or w in g or g in w
 
     def _poll_and_fetch(self, job: Job, work: str) -> RunResult:
         kid = self.kernel_id(job)
@@ -96,7 +102,7 @@ class KaggleProvider(Provider):
                 diag = self._read_diag(kid, work)
                 got = self.assigned_gpu(diag)
                 want = job.needs.get("gpu")
-                if want and got and want.lower() != got.lower():
+                if want and got and not self._gpu_matches(want, got):
                     return RunResult(False, "needs_setup",
                                      f"요청={want} 인데 실제={got}. UI에서 가속기 재설정 필요.",
                                      diag[-600:], "GPU_MISMATCH")
