@@ -12,24 +12,30 @@ import os
 import time
 from typing import Optional
 
-_DIR = os.environ.get("FREECLOUD_HOME", os.path.join(os.getcwd(), ".freecloud"))
-_PATH = os.path.join(_DIR, "cooldown.json")
+from . import paths
+
+# 쿨다운은 **사용자 전역**이다 — 쿼터 소진은 프로젝트가 아니라 계정의 속성이라, 실행
+# 디렉토리마다 갈라지면 이미 죽은 provider 를 다시 두드리게 된다. 상세는 paths.py.
+
+
+def _path() -> str:
+    return paths.user_file("cooldown.json")
 
 
 def _load() -> dict:
     try:
-        with open(_PATH, "r", encoding="utf-8") as f:
+        with open(_path(), "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
 
 def _save(d: dict) -> None:
-    os.makedirs(_DIR, exist_ok=True)
-    tmp = _PATH + ".tmp"
+    path = paths.ensure_user_home() and _path()
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, _PATH)
+    os.replace(tmp, path)
 
 
 def cooldown_remaining(provider: str) -> float:

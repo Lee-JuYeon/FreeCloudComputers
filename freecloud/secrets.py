@@ -15,29 +15,36 @@ import json
 import os
 import stat
 
-_DIR = os.environ.get("FREECLOUD_HOME", os.path.join(os.getcwd(), ".freecloud"))
-_PATH = os.path.join(_DIR, "secrets.json")
+from . import paths
+
+# 시크릿은 **사용자 전역**(~/.freecloud) — 프로젝트 디렉토리마다 토큰을 다시 넣게 하지 않고,
+# 레포 안에 자격증명이 쌓이지도 않게 한다. 상세는 paths.py.
 
 # job에 checkpoint_repo가 있으면 원격에 자동 주입할 시크릿 이름들(HF 계열).
 CKPT_SECRETS = ["HF_TOKEN", "HUGGINGFACE_TOKEN"]
 
 
+def _path() -> str:
+    return paths.user_file("secrets.json")
+
+
 def _load() -> dict:
     try:
-        with open(_PATH, "r", encoding="utf-8") as f:
+        with open(_path(), "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return {}
 
 
 def _save(d: dict) -> None:
-    os.makedirs(_DIR, exist_ok=True)
-    tmp = _PATH + ".tmp"
+    paths.ensure_user_home()
+    path = _path()
+    tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, _PATH)
+    os.replace(tmp, path)
     try:
-        os.chmod(_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 0600 (posix)
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600 (posix)
     except Exception:
         pass
 
