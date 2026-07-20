@@ -22,18 +22,30 @@ class AuthStatus:
 
 
 # ── 상태 체크 ────────────────────────────────────────────────────────────────
-def _hf_whoami() -> AuthStatus:
-    tok = secrets.get("HF_TOKEN") or secrets.get("HUGGINGFACE_TOKEN")
+def verify_hf_token(tok: str | None) -> tuple[bool, str]:
+    """HF 토큰 유효성 검증 → (ok, detail). run 프리플라이트와 상태표시가 공유.
+
+    - 토큰 없음        → (False, ...)  (확실히 실패)
+    - hub 미설치       → (True,  ...)  (로컬 검증 불가일 뿐 무효는 아님 → 원격서 검증)
+    - whoami 성공/실패 → (True/False, ...)
+    """
     if not tok:
-        return AuthStatus("huggingface", False, "HF_TOKEN 없음 → freecloud login huggingface")
+        return False, "HF_TOKEN 없음 → freecloud login huggingface"
     try:
         from huggingface_hub import HfApi
-        who = HfApi().whoami(token=tok)
-        return AuthStatus("huggingface", True, f"로그인됨: {who.get('name','?')}")
     except ImportError:
-        return AuthStatus("huggingface", False, "huggingface_hub 미설치(pip install 'freecloud[hub]').")
+        return True, "huggingface_hub 미설치 — 로컬 검증 생략(원격 노드서 설치·검증)."
+    try:
+        who = HfApi().whoami(token=tok)
+        return True, f"로그인됨: {who.get('name','?')}"
     except Exception as e:
-        return AuthStatus("huggingface", False, f"토큰 무효/네트워크: {str(e)[:80]}")
+        return False, f"토큰 무효/네트워크: {str(e)[:80]}"
+
+
+def _hf_whoami() -> AuthStatus:
+    tok = secrets.get("HF_TOKEN") or secrets.get("HUGGINGFACE_TOKEN")
+    ok, detail = verify_hf_token(tok)
+    return AuthStatus("huggingface", ok, detail)
 
 
 def status_all() -> list[AuthStatus]:
@@ -50,22 +62,41 @@ def status_all() -> list[AuthStatus]:
 
 
 # ── 로그인 핸들러 ────────────────────────────────────────────────────────────
+def _mirror_hf_cache(tok: str) -> str | None:
+    """표준 HF 캐시(~/.cache/huggingface/token)에도 미러.
+
+    이렇게 하면 freecloud 밖 도구들(`hf`/`huggingface_hub` CLI, Kaggle 토큰 임베드 런처 등)이
+    같은 토큰을 쓴다 → '한 곳 갱신 = 어디서든 반영'. HF_HOME 존중."""
+    try:
+        base = os.environ.get("HF_HOME") or os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+        os.makedirs(base, exist_ok=True)
+        path = os.path.join(base, "token")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(tok.strip())
+        try:
+            import stat as _stat
+            os.chmod(path, _stat.S_IRUSR | _stat.S_IWUSR)  # 0600 (posix)
+        except Exception:
+            pass
+        return path
+    except Exception as e:
+        print(f"(경고) HF 캐시 미러 실패: {str(e)[:80]}")
+        return None
+
+
 def login_huggingface() -> None:
-    """write 토큰을 붙여넣기 받아 whoami로 검증 후 저장."""
+    """write 토큰을 붙여넣기 받아 whoami로 검증 후 저장 + 표준 HF 캐시에 미러."""
     print("HF write 토큰을 발급하세요: https://huggingface.co/settings/tokens (Type: Write)")
     tok = _prompt_secret("HF 토큰 붙여넣기: ")
     if not tok:
         print("취소됨."); return
-    try:
-        from huggingface_hub import HfApi
-        who = HfApi().whoami(token=tok)
-    except ImportError:
-        print("huggingface_hub 미설치 → 검증 없이 저장(pip install 'freecloud[hub]' 권장).")
-        secrets.set("HF_TOKEN", tok); return
-    except Exception as e:
-        print(f"토큰 검증 실패(저장 안 함): {e}"); return
+    ok, detail = verify_hf_token(tok)
+    if not ok:
+        print(f"토큰 검증 실패(저장 안 함): {detail}"); return
     secrets.set("HF_TOKEN", tok)
-    print(f"저장 완료 — 계정: {who.get('name','?')}")
+    if _mirror_hf_cache(tok):
+        print("표준 HF 캐시(~/.cache/huggingface/token)에도 미러 — 외부 런처도 이 토큰 사용.")
+    print(f"저장 완료 — {detail}")
 
 
 def login_kaggle() -> None:

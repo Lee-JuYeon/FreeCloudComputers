@@ -13,6 +13,18 @@ from typing import Optional
 from ..job import Job
 
 
+def _gpu_match(need_gpu: str, cap_gpu: str) -> bool:
+    """job이 요구한 GPU를 이 provider가 제공하는가.
+
+    capabilities['gpu']는 여러 개를 '|'/','/'/'로 나열할 수 있고(예 'T4|L4|A10G'),
+    'T4x2'처럼 접미사가 붙기도 한다. 요구 모델명이 제공 토큰의 부분문자열이면(양방향) 매치.
+    이래야 needs:{gpu:'T4'} 가 kaggle(P100)을 제외하고 T4 제공자(kaggle-ui 'T4x2', colab 'T4' 등)를 고른다."""
+    import re
+    want = str(need_gpu).strip().upper()
+    offered = [t.strip().upper() for t in re.split(r"[|,/]", str(cap_gpu)) if t.strip()]
+    return any(want in tok or tok in want for tok in offered)
+
+
 @dataclass
 class Probe:
     available: bool
@@ -56,6 +68,10 @@ class Provider(ABC):
             return False, f"{self.name}: VRAM {cap_vram}<{need_vram}GB 요구"
         if job.needs.get("headless") and not self.capabilities.get("headless", True):
             return False, f"{self.name}: 헤드리스 미지원(UI 전용)"
+        need_gpu = job.needs.get("gpu")
+        cap_gpu = self.capabilities.get("gpu")
+        if need_gpu and cap_gpu and not _gpu_match(need_gpu, cap_gpu):
+            return False, f"{self.name}: GPU '{cap_gpu}' — '{need_gpu}' 요구 불충족"
         return True, ""
 
     # ── 공용 헬퍼 ────────────────────────────────────────────────────────────
