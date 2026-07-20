@@ -26,7 +26,8 @@ saturn = ["saturn-client>=0.5"]
 dev = ["pytest>=7"]
 
 [project.scripts]
-freecloud = "freecloud.cli:main"
+fcc = "freecloud.cli:main"
+freecloud = "freecloud.cli:main"   # 하위호환 별칭(구 이름)
 
 [project.urls]
 Homepage = "https://github.com/Lee-JuYeon/FreeCloudComputers"
