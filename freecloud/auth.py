@@ -61,6 +61,34 @@ def status_all() -> list[AuthStatus]:
     return out
 
 
+# ── 대화형 가드 ──────────────────────────────────────────────────────────────
+def _require_interactive(what: str, env_hint: str = "") -> None:
+    """비대화형이면 즉시 안내하고 끝낸다.
+
+    ⚠️ 이게 없으면 `getpass`/`input`이 입력할 수 없는 프롬프트에서 **영원히 멈춘다**
+    (실측 2026-07-21: 에이전트가 `fcc login huggingface`를 돌려 아무 출력 없이 행).
+    조용히 멈추는 것보다 빨리 실패하고 방법을 알려주는 편이 낫다.
+    """
+    if interactive_available():
+        return
+    lines = [
+        f"[freecloud] '{what}'에는 터미널 입력이 필요한데, 지금 stdin이 TTY가 아닙니다"
+        f"(파이프·에이전트·CI).",
+        "  이대로 두면 입력할 수 없는 프롬프트에서 멈춥니다 → 실제 터미널 창에서 실행하세요.",
+    ]
+    if env_hint:
+        lines.append(f"  무인으로 넘기려면 환경변수를 쓰세요:  {env_hint}")
+    raise SystemExit("\n".join(lines))
+
+
+def _from_env(*names: str) -> str | None:
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v.strip()
+    return None
+
+
 # ── 로그인 핸들러 ────────────────────────────────────────────────────────────
 def _mirror_hf_cache(tok: str) -> str | None:
     """표준 HF 캐시(~/.cache/huggingface/token)에도 미러.
@@ -86,8 +114,12 @@ def _mirror_hf_cache(tok: str) -> str | None:
 
 def login_huggingface() -> None:
     """write 토큰을 붙여넣기 받아 whoami로 검증 후 저장 + 표준 HF 캐시에 미러."""
-    print("HF write 토큰을 발급하세요: https://huggingface.co/settings/tokens (Type: Write)")
-    tok = _prompt_secret("HF 토큰 붙여넣기: ")
+    # env에 이미 있으면 프롬프트 없이 검증·저장 — 무인 경로.
+    tok = _from_env("HF_TOKEN", "HUGGINGFACE_TOKEN")
+    if not tok:
+        _require_interactive("HF 토큰 입력", "HF_TOKEN=hf_xxx fcc login huggingface")
+        print("HF write 토큰을 발급하세요: https://huggingface.co/settings/tokens (Type: Write)")
+        tok = _prompt_secret("HF 토큰 붙여넣기: ")
     if not tok:
         print("취소됨."); return
     ok, detail = verify_hf_token(tok)
@@ -105,10 +137,15 @@ def login_kaggle() -> None:
     if os.path.exists(kj):
         print(f"이미 있음: {kj} — 그대로 사용됩니다.")
         return
-    print("Kaggle 토큰: kaggle.com → Settings → API → 'Create New Token' → kaggle.json 다운로드")
-    print(f"그 파일을 {kj} 에 두거나, 아래에 username/key를 입력하세요.")
-    user = input("KAGGLE_USERNAME: ").strip()
-    key = _prompt_secret("KAGGLE_KEY: ")
+    user = _from_env("KAGGLE_USERNAME")
+    key = _from_env("KAGGLE_KEY")
+    if not (user and key):
+        _require_interactive("Kaggle username/key 입력",
+                             "KAGGLE_USERNAME=... KAGGLE_KEY=... fcc login kaggle")
+        print("Kaggle 토큰: kaggle.com → Settings → API → 'Create New Token' → kaggle.json 다운로드")
+        print(f"그 파일을 {kj} 에 두거나, 아래에 username/key를 입력하세요.")
+        user = input("KAGGLE_USERNAME: ").strip()
+        key = _prompt_secret("KAGGLE_KEY: ")
     if user and key:
         os.makedirs(os.path.dirname(kj), exist_ok=True)
         import json
@@ -127,17 +164,24 @@ def login_modal() -> None:
 
 
 def login_lightning() -> None:
-    print("Lightning: lightning.ai → Settings 에서 User ID / API Key 발급 후 env로 설정:")
-    print("  export LIGHTNING_USER_ID=... LIGHTNING_API_KEY=... LIGHTNING_TEAMSPACE=you/space")
-    key = _prompt_secret("LIGHTNING_API_KEY(저장하려면 붙여넣기, 건너뛰려면 Enter): ")
+    key = _from_env("LIGHTNING_API_KEY")
+    if not key:
+        _require_interactive("Lightning API key 입력",
+                             "LIGHTNING_API_KEY=... fcc login lightning")
+        print("Lightning: lightning.ai → Settings 에서 User ID / API Key 발급 후 env로 설정:")
+        print("  export LIGHTNING_USER_ID=... LIGHTNING_API_KEY=... LIGHTNING_TEAMSPACE=you/space")
+        key = _prompt_secret("LIGHTNING_API_KEY(저장하려면 붙여넣기, 건너뛰려면 Enter): ")
     if key:
         secrets.set("LIGHTNING_API_KEY", key)
         print("저장됨. USER_ID/TEAMSPACE는 env로 설정하세요.")
 
 
 def login_saturn() -> None:
-    print("Saturn Cloud: app.community.saturnenterprise.io → Settings 에서 User Token 발급.")
-    tok = _prompt_secret("SATURN_TOKEN 붙여넣기: ")
+    tok = _from_env("SATURN_TOKEN")
+    if not tok:
+        _require_interactive("Saturn 토큰 입력", "SATURN_TOKEN=... fcc login saturn")
+        print("Saturn Cloud: app.community.saturnenterprise.io → Settings 에서 User Token 발급.")
+        tok = _prompt_secret("SATURN_TOKEN 붙여넣기: ")
     if tok:
         secrets.set("SATURN_TOKEN", tok)
         print("저장됨.")
@@ -221,7 +265,12 @@ def ensure_for_job(job, order, interactive: bool = True) -> None:
 
 
 def _prompt_secret(prompt: str) -> str:
-    """터미널에서 시크릿 입력(가능하면 에코 없이)."""
+    """터미널에서 시크릿 입력(가능하면 에코 없이).
+
+    호출부가 _require_interactive 가드를 빠뜨려도 여기서 한 번 더 막는다 — 비대화형에서
+    프롬프트에 걸려 멈추는 것이 이 CLI에서 제일 진단하기 어려운 실패 모드였다.
+    """
+    _require_interactive(prompt.strip().rstrip(":"))
     try:
         import getpass
         return getpass.getpass(prompt).strip()
