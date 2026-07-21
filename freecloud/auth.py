@@ -37,9 +37,42 @@ def verify_hf_token(tok: str | None) -> tuple[bool, str]:
         return True, "huggingface_hub 미설치 — 로컬 검증 생략(원격 노드서 설치·검증)."
     try:
         who = HfApi().whoami(token=tok)
-        return True, f"로그인됨: {who.get('name','?')}"
     except Exception as e:
         return False, f"토큰 무효/네트워크: {str(e)[:80]}"
+    name = who.get("name", "?")
+    role = ((who.get("auth") or {}).get("accessToken") or {}).get("role")
+    # role 은 참고용으로만 붙인다 — 'fineGrained' 는 권한 구성에 따라 쓰기가 될 수도, 안 될
+    # 수도 있어 정적 판정이 불가능하다. 쓰기 가능 여부는 verify_hf_write() 로 실측한다.
+    return True, f"로그인됨: {name}" + (f" (토큰 role={role})" if role else "")
+
+
+def verify_hf_write(repo_id: str, tok: str | None = None) -> tuple[bool, str]:
+    """`repo_id` 에 실제로 쓸 수 있는지 실측 → (ok, detail).
+
+    whoami 는 **읽기 전용 토큰도 통과시킨다**. 그래서 토큰이 멀쩡해 보이는데 체크포인트
+    push 에서야 401 이 나고, 그때는 이미 쿼터·업로드·원격 부팅을 다 낭비한 뒤다
+    (실측 2026-07-21: role=fineGrained 토큰이 whoami 통과 후 create_repo 에서 401).
+
+    role 문자열로 추측하지 않고 **실제로 필요한 연산(create_repo exist_ok)** 을 미리 한다.
+    멱등이고, 어차피 런이 시작하자마자 할 일이라 부작용이 없다.
+    """
+    try:
+        from huggingface_hub import HfApi  # noqa: F401
+    except ImportError:
+        return True, "huggingface_hub 미설치 — 로컬 검증 생략."
+    try:
+        from .checkpoint import Checkpoint
+        Checkpoint(repo_id, token=tok).ensure_repo()
+        return True, f"쓰기 가능 확인: {repo_id}"
+    except Exception as e:
+        from .checkpoint import _is_auth_error
+        if _is_auth_error(e):
+            return False, (
+                f"토큰에 쓰기 권한이 없습니다({repo_id}). HF 토큰을 **Write** 로 다시 발급하세요 "
+                f"— https://huggingface.co/settings/tokens 에서 'Create new token' → Write. "
+                f"(Fine-grained 를 쓰신다면 해당 저장소에 대한 write 권한 + 저장소 생성 권한이 "
+                f"필요합니다.) 그 뒤 `fcc login huggingface`.")
+        return False, f"저장소 확인 실패: {str(e)[:100]}"
 
 
 def _hf_whoami() -> AuthStatus:
