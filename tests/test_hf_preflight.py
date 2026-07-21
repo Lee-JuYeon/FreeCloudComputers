@@ -1,0 +1,118 @@
+"""HF 토큰 처리 개선 회귀 테스트: verify/미러/프리플라이트/체크포인트 만료."""
+import os
+
+import pytest
+
+from freecloud import orchestrator, registry, state, checkpoint, auth
+from freecloud.job import Job
+from freecloud.providers.base import Provider, Probe, RunResult
+
+
+# ── verify_hf_token ──────────────────────────────────────────────────────────
+def test_verify_hf_token_none():
+    ok, detail = auth.verify_hf_token(None)
+    assert not ok and "HF_TOKEN" in detail
+
+
+def test_verify_hf_token_invalid(monkeypatch):
+    import huggingface_hub
+    def _boom(self, token=None):
+        raise RuntimeError("Invalid user token")
+    monkeypatch.setattr(huggingface_hub.HfApi, "whoami", _boom)
+    ok, detail = auth.verify_hf_token("hf_bad")
+    assert not ok
+
+
+def test_verify_hf_token_valid(monkeypatch):
+    import huggingface_hub
+    monkeypatch.setattr(huggingface_hub.HfApi, "whoami",
+                        lambda self, token=None: {"name": "tester"})
+    ok, detail = auth.verify_hf_token("hf_good")
+    assert ok and "tester" in detail
+
+
+# ── ~/.cache 미러 ────────────────────────────────────────────────────────────
+def test_mirror_hf_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    p = auth._mirror_hf_cache("hf_secret123\n")   # 개행 포함 → strip 확인
+    assert p and os.path.exists(p)
+    with open(p, encoding="utf-8") as f:
+        assert f.read() == "hf_secret123"
+
+
+# ── orchestrator 프리플라이트 ─────────────────────────────────────────────────
+class Fake(Provider):
+    def __init__(self, name="fake"):
+        self.name = name
+        self.capabilities = {"gpu": "T4", "vram_gb": 16, "headless": True}
+        self.calls = 0
+
+    def probe(self):
+        return Probe(True, "")
+
+    def run(self, job):
+        self.calls += 1
+        return RunResult(True, "done", "ok")
+
+
+def _wire(monkeypatch, fake):
+    monkeypatch.setattr(registry, "get", lambda n: fake)
+    monkeypatch.setattr(registry, "DEFAULT_ORDER", [fake.name])
+    state.clear_cooldown(fake.name)
+
+
+def test_preflight_blocks_before_dispatch(monkeypatch):
+    monkeypatch.setattr(auth, "verify_hf_token", lambda t: (False, "토큰 무효 test"))
+    fake = Fake()
+    _wire(monkeypatch, fake)
+    job = Job(name="t", entrypoint="x", checkpoint_repo="user/ckpt")
+    res = orchestrator.run(job, max_rounds=1)
+    assert not res["ok"]
+    assert fake.calls == 0                       # dispatch 前 차단 → 업로드/쿼터 낭비 없음
+    assert "프리플라이트" in res["reason"]
+
+
+def test_preflight_passes_with_valid_token(monkeypatch):
+    monkeypatch.setattr(auth, "verify_hf_token", lambda t: (True, "ok"))
+    fake = Fake()
+    _wire(monkeypatch, fake)
+    job = Job(name="t", entrypoint="x", checkpoint_repo="user/ckpt")
+    res = orchestrator.run(job, max_rounds=1)
+    assert res["ok"] and fake.calls == 1
+
+
+def test_preflight_skipped_when_hf_not_needed(monkeypatch):
+    called = {"v": False}
+    def _v(t):
+        called["v"] = True
+        return (False, "should-not-run")
+    monkeypatch.setattr(auth, "verify_hf_token", _v)
+    fake = Fake()
+    _wire(monkeypatch, fake)
+    res = orchestrator.run(Job(name="t", entrypoint="x"), max_rounds=1)   # checkpoint 없음
+    assert res["ok"] and not called["v"]         # HF 불필요 → 검증 자체를 안 함
+
+
+# ── 체크포인트 만료 우아처리 ──────────────────────────────────────────────────
+def test_is_auth_error():
+    assert checkpoint._is_auth_error(RuntimeError("401 Client Error: Unauthorized"))
+    assert checkpoint._is_auth_error(RuntimeError("Invalid user token"))
+    assert not checkpoint._is_auth_error(RuntimeError("connection reset by peer"))
+
+
+def test_push_preserves_local_on_auth_error(monkeypatch, tmp_path):
+    from freecloud.errors import classify, ABORT
+    ck = checkpoint.Checkpoint("user/ckpt", token="hf_x")
+    monkeypatch.setattr(ck, "ensure_repo", lambda: None)
+
+    class FakeApi:
+        def upload_folder(self, **k):
+            raise RuntimeError("401 Unauthorized: invalid token")
+
+    monkeypatch.setattr(ck, "_api", lambda: FakeApi())
+    src = str(tmp_path)
+    with pytest.raises(RuntimeError) as ei:
+        ck.push(src, step=5)
+    msg = str(ei.value)
+    assert "보존" in msg and src in msg           # 로컬 유실 없음 안내
+    assert classify(msg).action == ABORT          # 플레이북이 AUTH(사람개입)로 분류

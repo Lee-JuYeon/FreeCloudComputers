@@ -24,11 +24,37 @@ def _order(job: Job) -> list[str]:
     return job.providers or registry.DEFAULT_ORDER
 
 
+def _preflight(job: Job) -> dict | None:
+    """provider 시도 前 필수 시크릿을 검증. 문제 있으면 결과 dict(즉시 중단), 없으면 None.
+
+    데이터셋 업로드·쿼터·원격 부팅을 낭비한 뒤 커널 깊숙이서 죽는 대신, dispatch 前에
+    빠르게 실패시키고 사람이 읽을 조치를 준다. HF는 whoami로 실검증."""
+    from . import secrets
+    from .auth import verify_hf_token
+    needs_hf = bool(job.checkpoint_repo) or any(
+        s in ("HF_TOKEN", "HUGGINGFACE_TOKEN") for s in (job.secrets or []))
+    if needs_hf:
+        tok = secrets.get("HF_TOKEN") or secrets.get("HUGGINGFACE_TOKEN")
+        ok, detail = verify_hf_token(tok)
+        if not ok:
+            reason = (f"프리플라이트 실패(HF): {detail} — `freecloud login huggingface`로 "
+                      f"갱신 후 재실행. (체크포인트/게이티드 모델에 HF 토큰 필요.)")
+            print(f"[orch] {reason}", flush=True)
+            return dict(ok=False, provider=None, reason=reason,
+                        attempts=[dict(provider="(preflight)", ok=False,
+                                       error_class="AUTH", reason=detail)])
+    return None
+
+
 def run(job: Job, once: bool = False, max_rounds: int = 3) -> dict:
     """job을 성공할 때까지(또는 max_rounds 소진까지) provider들을 순회.
 
     반환: {ok, provider, reason, attempts:[...]}  ← CLI/MCP가 파싱.
     """
+    pf = _preflight(job)
+    if pf is not None:
+        return pf
+
     attempts: list[dict] = []
     names = _order(job)
 

@@ -20,6 +20,17 @@ import os
 from typing import Optional
 
 
+def _is_auth_error(e: Exception) -> bool:
+    """HF 인증/권한 오류인지(토큰 만료·무효·gated). 상태코드(401/403)도 확인."""
+    s = str(e).lower()
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    if code in (401, 403):
+        return True
+    return any(k in s for k in ("401", "403", "unauthorized", "authentication",
+                                "gated repo", "invalid user token", "invalid credentials",
+                                "invalid token", "permission denied"))
+
+
 class Checkpoint:
     def __init__(self, repo_id: str, token: Optional[str] = None, private: bool = True):
         self.repo_id = repo_id
@@ -60,12 +71,24 @@ class Checkpoint:
             return False
 
     def push(self, src: str, step: Optional[int] = None) -> None:
-        """src 폴더를 저장소로 업로드(덮어쓰기). N스텝마다 호출."""
-        self.ensure_repo()
-        api = self._api()
+        """src 폴더를 저장소로 업로드(덮어쓰기). N스텝마다 호출.
+
+        토큰이 런 도중 만료/무효가 되면(401) 진행분을 잃지 않도록 명확히 실패시킨다:
+        체크포인트는 이미 로컬 src에 있으므로 보존되며, 토큰 갱신 후 재개하면 이어서 push된다.
+        메시지에 '401/토큰' 키워드를 담아 errors 플레이북이 AUTH로 분류(→ 사람 개입)하게 한다."""
         msg = f"checkpoint step={step}" if step is not None else "checkpoint"
-        api.upload_folder(folder_path=src, repo_id=self.repo_id, repo_type="model",
-                          commit_message=msg)
+        try:
+            self.ensure_repo()
+            api = self._api()
+            api.upload_folder(folder_path=src, repo_id=self.repo_id, repo_type="model",
+                              commit_message=msg)
+        except Exception as e:
+            if _is_auth_error(e):
+                raise RuntimeError(
+                    f"[checkpoint] HF 토큰 만료/무효(401 unauthorized) — 체크포인트는 로컬 "
+                    f"'{src}'에 보존됨(유실 없음). `freecloud login huggingface`로 갱신 후 "
+                    f"재개하면 이어서 push됨. 원인: {str(e)[:120]}") from e
+            raise
         print(f"[checkpoint] push {src} → {self.repo_id} ({msg})", flush=True)
 
     def last_step(self) -> Optional[int]:

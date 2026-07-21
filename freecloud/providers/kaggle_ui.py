@@ -18,15 +18,57 @@ Settings→Accelerator→GPU T4 x2→Save를 눌러야 한다. 이 어댑터가 
 from __future__ import annotations
 
 import os
+import re
 
 from ..job import Job
 from .base import Probe, RunResult
 from .kaggle import KaggleProvider
 
-STATE_PATH = os.environ.get(
-    "FREECLOUD_KAGGLE_STATE",
-    os.path.join(os.environ.get("FREECLOUD_HOME", os.path.join(os.getcwd(), ".freecloud")),
-                 "kaggle_state.json"))
+_HOME = os.environ.get("FREECLOUD_HOME", os.path.join(os.getcwd(), ".freecloud"))
+STATE_PATH = os.environ.get("FREECLOUD_KAGGLE_STATE",
+                            os.path.join(_HOME, "kaggle_state.json"))
+# 실제 Chrome 프로필 — Google이 번들 Chromium 로그인을 차단하므로 영속 프로필 사용.
+PROFILE_DIR = os.environ.get("FREECLOUD_KAGGLE_PROFILE",
+                             os.path.join(_HOME, "chrome_profile"))
+
+
+def _cookie_says_anon(cookies) -> bool | None:
+    """Kaggle CLIENT-TOKEN(JWT)의 anon 클레임 → True=미로그인, False=로그인, None=판정불가.
+
+    로그인 여부를 '파일 존재'가 아니라 실제 세션 내용으로 판정하기 위한 것.
+    JWT는 서명 검증 없이 페이로드만 읽는다(우리 자신의 쿠키 상태 확인 용도).
+    """
+    import base64
+    import json
+    for c in cookies or []:
+        if (c.get("name") if isinstance(c, dict) else None) != "CLIENT-TOKEN":
+            continue
+        try:
+            payload = c["value"].split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload))
+            return bool(data.get("anon", False))
+        except Exception:
+            return None
+    return None
+
+
+def session_is_logged_in(path: str = STATE_PATH) -> tuple[bool, str]:
+    """저장된 storage_state가 '실제 로그인된' 세션인지 → (ok, detail)."""
+    import json
+    if not os.path.exists(path):
+        return False, f"로그인 상태 없음 → 'fcc kaggle-login' 실행({path})."
+    try:
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception as e:
+        return False, f"상태 파일 손상({type(e).__name__}) → 'fcc kaggle-login' 재실행."
+    anon = _cookie_says_anon(state.get("cookies"))
+    if anon is True:
+        return False, "저장된 세션이 익명(미로그인) → 'fcc kaggle-login' 재실행."
+    if anon is None:
+        return False, "세션에 CLIENT-TOKEN 없음(미로그인 추정) → 'fcc kaggle-login' 재실행."
+    return True, "로그인된 세션."
 
 
 class KaggleUIProvider(KaggleProvider):
@@ -47,16 +89,20 @@ class KaggleUIProvider(KaggleProvider):
             return base
         if self._pw() is None:
             return Probe(False, "playwright 미설치(pip install 'freecloud[kaggle-ui]' && playwright install chromium).")
-        if not os.path.exists(STATE_PATH):
-            return Probe(False, f"로그인 상태 없음 → 먼저 'freecloud kaggle-login' 실행({STATE_PATH}).")
+        # ⚠️ 파일 존재만 보면 '익명 세션'이 통과해 실패가 AUTH가 아닌 UI_AUTOMATION으로
+        #    오분류된다(실측 2026-07-20). 세션 내용까지 검사한다.
+        ok, detail = session_is_logged_in(STATE_PATH)
+        if not ok:
+            return Probe(False, detail)
         return Probe(True, "kaggle-ui 준비 OK(Playwright + 저장된 로그인).")
 
     def run(self, job: Job) -> RunResult:
         if self._pw() is None:
             return RunResult(False, "error", "playwright 미설치.", error_class="JOB_CONFIG")
-        if not os.path.exists(STATE_PATH):
-            return RunResult(False, "needs_setup",
-                             "kaggle-login 선행 필요(로그인 상태 파일 없음).", error_class="AUTH")
+        ok, detail = session_is_logged_in(STATE_PATH)
+        if not ok:
+            return RunResult(False, "needs_setup", f"kaggle-login 선행 필요: {detail}",
+                             error_class="AUTH")
         # 1) 코드 push(커널 등록)
         work = self._write_kernel_dir(job)
         rc, log = self._push(work, job)
@@ -85,7 +131,11 @@ class KaggleUIProvider(KaggleProvider):
             ctx = browser.new_context(storage_state=STATE_PATH)
             page = ctx.new_page()
             try:
-                page.goto(url, wait_until="networkidle", timeout=60000)
+                # ⚠️ networkidle 금지 — Kaggle 에디터는 웹소켓/폴링이 상시 열려 있어
+                #    '유휴'가 영원히 오지 않는다(실측: goto 60s 타임아웃 3연속).
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                # SPA가 에디터를 렌더할 때까지는 별도로 기다린다.
+                page.wait_for_selector("text=Save Version", timeout=60000)
 
                 # (a) 가속기 설정 열기 — Settings 사이드바의 'Accelerator' 섹션.
                 #     ⚠️ Kaggle DOM 변동 → 여러 방식 fallback. 라이브 검증 시 조정.
@@ -106,59 +156,153 @@ class KaggleUIProvider(KaggleProvider):
 
     @staticmethod
     def _select_accelerator(page, label: str) -> None:
-        """가속기 드롭다운에서 label 선택. best-effort 다단 fallback."""
-        # 설정 패널이 접혀있으면 'Accelerator' 헤더 클릭해 펼치기 시도
-        for opener in ("Accelerator", "Settings", "Session options"):
+        """가속기 콤보박스에서 label 선택. 실패하면 조용히 넘어가지 않고 예외를 던진다.
+
+        실측 DOM(2026-07-20 라이브 덤프):
+          · 패널 토글  = button  "Expand Session options" / "Collapse Session options"
+          · 가속기     = div[role=combobox] aria-label="Select Accelerator. <현재값> currently selected."
+          · 옵션       = role=option  name ∈ {"None", "GPU T4 x2", "GPU P100"}
+        ('Accelerator'/'T4' 텍스트로는 못 찾는다 — 콤보박스를 열기 전엔 DOM에 없음.)
+
+        ⚠️ 구버전은 전 단계가 try/except라 아무것도 못 찾아도 통과했고, 그 과정에서 상단
+           'Settings' 메뉴를 열어둔 채 빠져나와 다음 단계(Save Version) 클릭을 오버레이로
+           막았다. 그래서 여기서는 실패를 반드시 표면화한다.
+        """
+        # 1) 패널 펼치기 — 이미 펼쳐져 있으면 이 버튼이 없으므로(=Collapse) 무시.
+        try:
+            page.get_by_role("button", name="Expand Session options").click(timeout=8000)
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+        combo = page.get_by_role("combobox", name=re.compile("Select Accelerator"))
+        current = combo.first.get_attribute("aria-label") or ""
+        if f"{label} currently selected" in current:
+            return  # 이미 원하는 가속기 — 건드리지 않는다.
+
+        # 2) 열고 옵션 선택
+        combo.first.click(timeout=10000)
+        page.wait_for_timeout(1000)
+        page.get_by_role("option", name=label, exact=True).click(timeout=10000)
+        page.wait_for_timeout(2000)
+
+        # 3) 전환 확인 다이얼로그가 뜨면 승인(세션 재시작 안내 등). 없으면 그냥 통과.
+        for confirm in ("Turn on GPU", "Confirm", "OK", "Yes"):
             try:
-                page.get_by_text(opener, exact=False).first.click(timeout=4000)
+                page.get_by_role("button", name=confirm, exact=False).first.click(timeout=2500)
                 break
             except Exception:
                 continue
-        # 현재 값(None/GPU P100 등) 버튼을 눌러 옵션 목록 열기
-        for cur in ("GPU P100", "None", "GPU T4 x2", "Accelerator"):
-            try:
-                page.get_by_text(cur, exact=False).first.click(timeout=3000)
-                break
-            except Exception:
-                continue
-        # 원하는 옵션 클릭
-        page.get_by_text(label, exact=False).first.click(timeout=8000)
+
+        # 4) 실제로 바뀌었는지 검증 — '조용한 실패'를 여기서 차단.
+        page.wait_for_timeout(1500)
+        after = combo.first.get_attribute("aria-label") or ""
+        if f"{label} currently selected" not in after:
+            raise RuntimeError(f"가속기 전환 실패: 기대={label!r}, 현재 aria-label={after!r}")
 
     @staticmethod
     def _save_and_run_all(page) -> None:
-        page.get_by_role("button", name="Save Version").click(timeout=10000)
-        # 다이얼로그: 'Save & Run All (Commit)' 라디오 선택
-        for opt in ("Save & Run All", "Save & Run All (Commit)", "Run All"):
-            try:
-                page.get_by_text(opt, exact=False).first.click(timeout=3000)
-                break
-            except Exception:
-                continue
-        page.get_by_role("button", name="Save").last.click(timeout=10000)
+        """'Save Version' → 'Save & Run All (Commit)' 커밋 제출.
+
+        실측 다이얼로그(2026-07-20):
+          · role=dialog 없음(Kaggle 모달은 그 role을 안 씀) — 존재 확인은 버튼으로 한다.
+          · VERSION TYPE 콤보박스 기본값이 이미 'Save & Run All (Commit)' → 라디오 없음.
+            (구코드가 찾던 라디오는 UI 개편으로 사라졌다.)
+          · 하단 버튼 = 'Cancel' / 'Save'.
+        """
+        page.get_by_role("button", name="Save Version", exact=True).click(timeout=15000)
+        page.wait_for_timeout(2500)
+
+        # VERSION TYPE 확인 — 기본이 아니면 드롭다운에서 명시적으로 고른다.
+        try:
+            if page.get_by_text("Save & Run All", exact=False).count() == 0:
+                page.get_by_role("combobox").last.click(timeout=5000)
+                page.get_by_role("option", name=re.compile("Save & Run All")).first.click(timeout=5000)
+                page.wait_for_timeout(1000)
+        except Exception:
+            pass  # 기본값이면 손댈 필요 없음
+
+        # ⚠️ exact=True 필수. 부분일치면 name="Save"가 툴바 'Save Version'에도 매칭되고,
+        #    구코드의 .last가 그 가려진 버튼을 집어 actionability 대기로 타임아웃났다(실측).
+        page.get_by_role("button", name="Save", exact=True).click(timeout=15000)
+
+        # 제출되면 모달이 닫힌다 — 안 닫히면 실패를 표면화.
+        try:
+            page.get_by_role("button", name="Save", exact=True).wait_for(
+                state="hidden", timeout=20000)
+        except Exception:
+            raise RuntimeError("저장 다이얼로그가 닫히지 않음 — 커밋 제출 실패 가능.")
 
 
-def save_login_state(headful: bool = True) -> str:
-    """`freecloud kaggle-login` 구현 — 브라우저 띄워 사용자가 직접 로그인하면 상태 저장.
+def save_login_state(headful: bool = True, timeout_s: int = 300) -> str:
+    """`fcc kaggle-login` 구현 — 브라우저 띄워 사용자가 직접 로그인하면 상태 저장.
 
     2FA 포함 로그인은 사람이 하고, 그 세션(쿠키)을 파일로 저장해 이후 무인 자동화가 재사용.
+
+    ⚠️ 실측(2026-07-20): Playwright 번들 Chromium으로는 Google이 로그인을 차단한다
+      ("브라우저 또는 앱이 안전하지 않을 수 있습니다 … 로그인할 수 없음") — 패스키/PIN을
+      다 통과해도 마지막에 막힘. 그래서 **시스템에 설치된 실제 Chrome + 영속 프로필**을 쓰고
+      자동화 표식(--enable-automation, navigator.webdriver)을 끈다.
+
+    또한 Enter 입력(input())에 의존하지 않는다 — 비대화형(에이전트/파이프)에서 즉시 EOF가 나
+    미로그인 세션이 저장되던 문제가 있었다. 대신 쿠키를 폴링해 실제 로그인 완료를 감지한다.
     """
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
         raise SystemExit("pip install 'freecloud[kaggle-ui]' && playwright install chromium")
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)  # 로그인은 반드시 headful
-        ctx = browser.new_context()
-        page = ctx.new_page()
-        page.goto("https://www.kaggle.com/account/login", wait_until="networkidle")
-        print("브라우저에서 Kaggle 로그인을 완료하세요(2FA 포함). "
-              "로그인 후 이 터미널에서 Enter를 누르면 세션을 저장합니다.")
-        try:
-            input()
-        except EOFError:
-            page.wait_for_timeout(60000)
+        ctx = None
+        last_err = None
+        # 실제 Chrome 우선 → Edge → 번들 Chromium(차단 가능성 높음, 최후수단).
+        for channel in ("chrome", "msedge", None):
+            try:
+                ctx = p.chromium.launch_persistent_context(
+                    PROFILE_DIR,
+                    headless=False,  # 로그인은 반드시 headful
+                    channel=channel,
+                    args=["--disable-blink-features=AutomationControlled"],
+                    ignore_default_args=["--enable-automation"],
+                )
+                if channel:
+                    print(f"브라우저: 실제 {channel} + 영속 프로필({PROFILE_DIR})")
+                else:
+                    print("⚠ 실제 Chrome/Edge를 못 찾아 번들 Chromium 사용 — Google이 차단할 수 있음.")
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if ctx is None:
+            raise SystemExit(f"브라우저 실행 실패: {last_err}")
+
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto("https://www.kaggle.com/account/login", wait_until="domcontentloaded")
+        print(f"브라우저에서 Kaggle 로그인을 완료하세요(2FA 포함). 최대 {timeout_s}초 대기하며, "
+              "로그인이 감지되면 자동으로 저장하고 닫힙니다.")
+
+        ok = False
+        waited = 0
+        while waited < timeout_s:
+            page.wait_for_timeout(3000)
+            waited += 3
+            try:
+                if _cookie_says_anon(ctx.cookies()) is False:
+                    ok = True
+                    break
+            except Exception:
+                pass  # 페이지 전환 중 일시적 실패는 무시하고 계속 폴링
+
         ctx.storage_state(path=STATE_PATH)
-        browser.close()
-    print(f"로그인 상태 저장됨 → {STATE_PATH}")
+        ctx.close()
+
+    # ⚠️ Windows 콘솔(cp949)은 이모지를 못 찍는다 — 여기서 UnicodeEncodeError로 죽으면
+    #    로그인이 성공했는데도 실패처럼 보인다(실측 2026-07-20). CLI 출력은 ASCII로.
+    if ok:
+        print(f"[OK] 로그인 확인 + 상태 저장됨 -> {STATE_PATH}")
+    else:
+        print(f"[FAIL] {timeout_s}초 내 로그인 감지 실패 - 저장은 했지만 미로그인 상태일 수 있음 "
+              f"({STATE_PATH}). 'fcc providers'로 확인하세요.")
     return STATE_PATH

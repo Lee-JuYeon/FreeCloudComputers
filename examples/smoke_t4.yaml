@@ -1,0 +1,10 @@
+# T4 선택 스모크 — needs.gpu=T4 이면 freecloud가 P100(kaggle)을 제외하고
+# T4 제공자(kaggle-ui 'T4x2' / colab 'T4')를 고르는지 확인.
+name: smoke-t4
+entrypoint: "nvidia-smi -L && python -c \"print('t4 ok from freecloud')\""
+checkpoint_repo: ""
+needs:
+  gpu: "T4"
+  headless: true
+max_runtime_s: 1800
+providers: [kaggle, kaggle-ui]
