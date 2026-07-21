@@ -86,7 +86,15 @@ def _cmd_auth(args) -> int:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="freecloud",
+    # 구버전(cwd 상대)에 남은 로그인·시크릿·쿨다운을 사용자 전역으로 1회 승격.
+    # 안 하면 예전 디렉토리에서 만든 로그인이 고아가 된다. 옮길 게 없으면 조용히 지나간다.
+    try:
+        from . import paths
+        paths.migrate_legacy()
+    except Exception:
+        pass  # 마이그레이션 실패가 CLI 자체를 막지는 않게 한다.
+
+    ap = argparse.ArgumentParser(prog="fcc",
                                  description="무료(비중국) 클라우드 GPU 페일오버 오케스트레이터")
     sub = ap.add_subparsers(dest="cmd", required=True)
 

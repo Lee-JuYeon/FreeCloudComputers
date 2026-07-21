@@ -31,10 +31,34 @@ def _is_auth_error(e: Exception) -> bool:
                                 "invalid token", "permission denied"))
 
 
+def _has_payload(d: str) -> bool:
+    """dest 에 '진짜 체크포인트'가 있는가.
+
+    ⚠️ `any(os.scandir(d))` 로는 안 된다. HF 는 저장소를 만들 때 `.gitattributes` 를 자동
+    생성하고, snapshot_download 는 `.cache/` 를 남긴다. 그래서 **한 번도 push 한 적 없는
+    빈 저장소도 항상 resume=True 로 보고**됐다(실측 2026-07-21). 학습 스크립트가 이 값으로
+    scratch/resume 을 분기하면 처음 실행인데 재개 경로를 타게 된다.
+    """
+    for e in os.scandir(d):
+        if e.name.startswith(".") or e.name == "README.md":
+            continue  # HF 메타데이터(.gitattributes/.cache/…)는 페이로드가 아니다
+        return True
+    return False
+
+
 class Checkpoint:
     def __init__(self, repo_id: str, token: Optional[str] = None, private: bool = True):
         self.repo_id = repo_id
+        # env 우선(원격 노드는 resolved_env 로 주입받는다) → 없으면 로컬 시크릿 저장소.
+        # ⚠️ 저장소 폴백이 없으면, `fcc login huggingface` 로 저장만 하고 env 를 안 쓰는
+        #    사용자는 로컬에서 토큰을 못 찾는다(HF 캐시 미러에 우연히 기대게 됨).
         self.token = token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+        if not self.token:
+            try:
+                from . import secrets
+                self.token = secrets.get("HF_TOKEN") or secrets.get("HUGGINGFACE_TOKEN")
+            except Exception:
+                pass
         self.private = private
 
     @classmethod
@@ -63,7 +87,7 @@ class Checkpoint:
         try:
             snapshot_download(self.repo_id, repo_type="model", local_dir=dest,
                               token=self.token)
-            has = any(os.scandir(dest))
+            has = _has_payload(dest)
             print(f"[checkpoint] pull {self.repo_id} → {dest} (resume={has})", flush=True)
             return has
         except RepositoryNotFoundError:

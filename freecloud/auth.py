@@ -37,9 +37,42 @@ def verify_hf_token(tok: str | None) -> tuple[bool, str]:
         return True, "huggingface_hub 미설치 — 로컬 검증 생략(원격 노드서 설치·검증)."
     try:
         who = HfApi().whoami(token=tok)
-        return True, f"로그인됨: {who.get('name','?')}"
     except Exception as e:
         return False, f"토큰 무효/네트워크: {str(e)[:80]}"
+    name = who.get("name", "?")
+    role = ((who.get("auth") or {}).get("accessToken") or {}).get("role")
+    # role 은 참고용으로만 붙인다 — 'fineGrained' 는 권한 구성에 따라 쓰기가 될 수도, 안 될
+    # 수도 있어 정적 판정이 불가능하다. 쓰기 가능 여부는 verify_hf_write() 로 실측한다.
+    return True, f"로그인됨: {name}" + (f" (토큰 role={role})" if role else "")
+
+
+def verify_hf_write(repo_id: str, tok: str | None = None) -> tuple[bool, str]:
+    """`repo_id` 에 실제로 쓸 수 있는지 실측 → (ok, detail).
+
+    whoami 는 **읽기 전용 토큰도 통과시킨다**. 그래서 토큰이 멀쩡해 보이는데 체크포인트
+    push 에서야 401 이 나고, 그때는 이미 쿼터·업로드·원격 부팅을 다 낭비한 뒤다
+    (실측 2026-07-21: role=fineGrained 토큰이 whoami 통과 후 create_repo 에서 401).
+
+    role 문자열로 추측하지 않고 **실제로 필요한 연산(create_repo exist_ok)** 을 미리 한다.
+    멱등이고, 어차피 런이 시작하자마자 할 일이라 부작용이 없다.
+    """
+    try:
+        from huggingface_hub import HfApi  # noqa: F401
+    except ImportError:
+        return True, "huggingface_hub 미설치 — 로컬 검증 생략."
+    try:
+        from .checkpoint import Checkpoint
+        Checkpoint(repo_id, token=tok).ensure_repo()
+        return True, f"쓰기 가능 확인: {repo_id}"
+    except Exception as e:
+        from .checkpoint import _is_auth_error
+        if _is_auth_error(e):
+            return False, (
+                f"토큰에 쓰기 권한이 없습니다({repo_id}). HF 토큰을 **Write** 로 다시 발급하세요 "
+                f"— https://huggingface.co/settings/tokens 에서 'Create new token' → Write. "
+                f"(Fine-grained 를 쓰신다면 해당 저장소에 대한 write 권한 + 저장소 생성 권한이 "
+                f"필요합니다.) 그 뒤 `fcc login huggingface`.")
+        return False, f"저장소 확인 실패: {str(e)[:100]}"
 
 
 def _hf_whoami() -> AuthStatus:
@@ -59,6 +92,55 @@ def status_all() -> list[AuthStatus]:
         except Exception as e:
             out.append(AuthStatus(name, False, str(e)[:80]))
     return out
+
+
+# ── 대화형 가드 ──────────────────────────────────────────────────────────────
+def _require_interactive(what: str, env_hint: str = "") -> None:
+    """비대화형이면 즉시 안내하고 끝낸다.
+
+    ⚠️ 이게 없으면 `getpass`/`input`이 입력할 수 없는 프롬프트에서 **영원히 멈춘다**
+    (실측 2026-07-21: 에이전트가 `fcc login huggingface`를 돌려 아무 출력 없이 행).
+    조용히 멈추는 것보다 빨리 실패하고 방법을 알려주는 편이 낫다.
+    """
+    if interactive_available():
+        return
+    lines = [
+        f"[freecloud] '{what}'에는 터미널 입력이 필요한데, 지금 stdin이 TTY가 아닙니다"
+        f"(파이프·에이전트·CI).",
+        "  이대로 두면 입력할 수 없는 프롬프트에서 멈춥니다 → 실제 터미널 창에서 실행하세요.",
+    ]
+    if env_hint:
+        lines.append(f"  무인으로 넘기려면 환경변수를 쓰세요:  {env_hint}")
+    raise SystemExit("\n".join(lines))
+
+
+def _warn_if_env_shadows(name: str, stored: str) -> None:
+    """저장한 값이 환경변수에 가려지면 크게 경고한다.
+
+    secrets.get() 은 'env 우선, 없으면 저장소'다. 그래서 만료된 토큰이 env 에 영구 설정돼
+    있으면, 새 토큰을 저장해도 계속 낡은 값이 쓰인다 — 로그인은 성공한 것처럼 보이는데
+    실제 사용은 계속 실패하는, 알아채기 매우 어려운 상태가 된다(실측 2026-07-21).
+    """
+    env_val = os.environ.get(name)
+    if not env_val or env_val.strip() == stored.strip():
+        return
+    print()
+    print(f"⚠ 경고: 환경변수 {name} 이(가) 방금 저장한 값과 다릅니다.")
+    print(f"  secrets 는 env 를 우선하므로, 이대로면 저장한 토큰이 아니라 env 값이 쓰입니다.")
+    print(f"  env 값을 지우세요:")
+    print(f"    PowerShell(현재 세션):  $env:{name}=$null")
+    print(f"    PowerShell(영구):       [Environment]::SetEnvironmentVariable('{name}', $null, 'User')")
+    print(f"    bash:                   unset {name}")
+    print(f"  (지운 뒤 새 터미널에서 `fcc auth` 로 확인하세요.)")
+    print()
+
+
+def _from_env(*names: str) -> str | None:
+    for n in names:
+        v = os.environ.get(n)
+        if v:
+            return v.strip()
+    return None
 
 
 # ── 로그인 핸들러 ────────────────────────────────────────────────────────────
@@ -86,14 +168,31 @@ def _mirror_hf_cache(tok: str) -> str | None:
 
 def login_huggingface() -> None:
     """write 토큰을 붙여넣기 받아 whoami로 검증 후 저장 + 표준 HF 캐시에 미러."""
-    print("HF write 토큰을 발급하세요: https://huggingface.co/settings/tokens (Type: Write)")
-    tok = _prompt_secret("HF 토큰 붙여넣기: ")
+    # env에 있으면 먼저 시도(무인 경로). ⚠️ 단, 만료·무효면 여기서 끝내지 않는다 —
+    #    그러면 만료 토큰이 env에 남아있는 사람은 새 토큰을 넣을 기회조차 없다(실측).
+    tok = _from_env("HF_TOKEN", "HUGGINGFACE_TOKEN")
+    if tok:
+        ok, detail = verify_hf_token(tok)
+        if ok:
+            secrets.set("HF_TOKEN", tok)
+            _mirror_hf_cache(tok)
+            print(f"env 토큰이 유효합니다 — 저장 완료. {detail}")
+            return
+        print(f"env 의 HF 토큰이 무효합니다: {detail}")
+        print("→ 새 토큰을 입력받겠습니다.")
+        tok = None
+
+    if not tok:
+        _require_interactive("HF 토큰 입력", "HF_TOKEN=hf_xxx fcc login huggingface")
+        print("HF write 토큰을 발급하세요: https://huggingface.co/settings/tokens (Type: Write)")
+        tok = _prompt_secret("HF 토큰 붙여넣기: ")
     if not tok:
         print("취소됨."); return
     ok, detail = verify_hf_token(tok)
     if not ok:
         print(f"토큰 검증 실패(저장 안 함): {detail}"); return
     secrets.set("HF_TOKEN", tok)
+    _warn_if_env_shadows("HF_TOKEN", tok)
     if _mirror_hf_cache(tok):
         print("표준 HF 캐시(~/.cache/huggingface/token)에도 미러 — 외부 런처도 이 토큰 사용.")
     print(f"저장 완료 — {detail}")
@@ -105,10 +204,15 @@ def login_kaggle() -> None:
     if os.path.exists(kj):
         print(f"이미 있음: {kj} — 그대로 사용됩니다.")
         return
-    print("Kaggle 토큰: kaggle.com → Settings → API → 'Create New Token' → kaggle.json 다운로드")
-    print(f"그 파일을 {kj} 에 두거나, 아래에 username/key를 입력하세요.")
-    user = input("KAGGLE_USERNAME: ").strip()
-    key = _prompt_secret("KAGGLE_KEY: ")
+    user = _from_env("KAGGLE_USERNAME")
+    key = _from_env("KAGGLE_KEY")
+    if not (user and key):
+        _require_interactive("Kaggle username/key 입력",
+                             "KAGGLE_USERNAME=... KAGGLE_KEY=... fcc login kaggle")
+        print("Kaggle 토큰: kaggle.com → Settings → API → 'Create New Token' → kaggle.json 다운로드")
+        print(f"그 파일을 {kj} 에 두거나, 아래에 username/key를 입력하세요.")
+        user = input("KAGGLE_USERNAME: ").strip()
+        key = _prompt_secret("KAGGLE_KEY: ")
     if user and key:
         os.makedirs(os.path.dirname(kj), exist_ok=True)
         import json
@@ -127,17 +231,24 @@ def login_modal() -> None:
 
 
 def login_lightning() -> None:
-    print("Lightning: lightning.ai → Settings 에서 User ID / API Key 발급 후 env로 설정:")
-    print("  export LIGHTNING_USER_ID=... LIGHTNING_API_KEY=... LIGHTNING_TEAMSPACE=you/space")
-    key = _prompt_secret("LIGHTNING_API_KEY(저장하려면 붙여넣기, 건너뛰려면 Enter): ")
+    key = _from_env("LIGHTNING_API_KEY")
+    if not key:
+        _require_interactive("Lightning API key 입력",
+                             "LIGHTNING_API_KEY=... fcc login lightning")
+        print("Lightning: lightning.ai → Settings 에서 User ID / API Key 발급 후 env로 설정:")
+        print("  export LIGHTNING_USER_ID=... LIGHTNING_API_KEY=... LIGHTNING_TEAMSPACE=you/space")
+        key = _prompt_secret("LIGHTNING_API_KEY(저장하려면 붙여넣기, 건너뛰려면 Enter): ")
     if key:
         secrets.set("LIGHTNING_API_KEY", key)
         print("저장됨. USER_ID/TEAMSPACE는 env로 설정하세요.")
 
 
 def login_saturn() -> None:
-    print("Saturn Cloud: app.community.saturnenterprise.io → Settings 에서 User Token 발급.")
-    tok = _prompt_secret("SATURN_TOKEN 붙여넣기: ")
+    tok = _from_env("SATURN_TOKEN")
+    if not tok:
+        _require_interactive("Saturn 토큰 입력", "SATURN_TOKEN=... fcc login saturn")
+        print("Saturn Cloud: app.community.saturnenterprise.io → Settings 에서 User Token 발급.")
+        tok = _prompt_secret("SATURN_TOKEN 붙여넣기: ")
     if tok:
         secrets.set("SATURN_TOKEN", tok)
         print("저장됨.")
@@ -221,7 +332,12 @@ def ensure_for_job(job, order, interactive: bool = True) -> None:
 
 
 def _prompt_secret(prompt: str) -> str:
-    """터미널에서 시크릿 입력(가능하면 에코 없이)."""
+    """터미널에서 시크릿 입력(가능하면 에코 없이).
+
+    호출부가 _require_interactive 가드를 빠뜨려도 여기서 한 번 더 막는다 — 비대화형에서
+    프롬프트에 걸려 멈추는 것이 이 CLI에서 제일 진단하기 어려운 실패 모드였다.
+    """
+    _require_interactive(prompt.strip().rstrip(":"))
     try:
         import getpass
         return getpass.getpass(prompt).strip()

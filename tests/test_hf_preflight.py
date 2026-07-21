@@ -74,11 +74,42 @@ def test_preflight_blocks_before_dispatch(monkeypatch):
 
 def test_preflight_passes_with_valid_token(monkeypatch):
     monkeypatch.setattr(auth, "verify_hf_token", lambda t: (True, "ok"))
+    monkeypatch.setattr(auth, "verify_hf_write", lambda r, t=None: (True, "쓰기 OK"))
     fake = Fake()
     _wire(monkeypatch, fake)
     job = Job(name="t", entrypoint="x", checkpoint_repo="user/ckpt")
     res = orchestrator.run(job, max_rounds=1)
     assert res["ok"] and fake.calls == 1
+
+
+def test_preflight_blocks_when_token_cannot_write(monkeypatch):
+    """whoami 통과 ≠ 쓰기 가능. 읽기 전용 토큰은 dispatch 前에 걸러야 한다 —
+    안 그러면 런이 끝나갈 무렵 체크포인트 push 에서 401 이 나고 쿼터를 날린다."""
+    monkeypatch.setattr(auth, "verify_hf_token", lambda t: (True, "ok"))
+    monkeypatch.setattr(auth, "verify_hf_write",
+                        lambda r, t=None: (False, "토큰에 쓰기 권한이 없습니다"))
+    fake = Fake()
+    _wire(monkeypatch, fake)
+    job = Job(name="t", entrypoint="x", checkpoint_repo="user/ckpt")
+    res = orchestrator.run(job, max_rounds=1)
+    assert not res["ok"]
+    assert fake.calls == 0
+    assert "쓰기 권한" in res["reason"]
+
+
+def test_preflight_write검사는_체크포인트_없으면_안한다(monkeypatch):
+    """checkpoint_repo 가 없으면 쓸 저장소가 없으니 write 검사도 없어야 한다."""
+    monkeypatch.setattr(auth, "verify_hf_token", lambda t: (True, "ok"))
+    called = {"w": False}
+    def _w(r, t=None):
+        called["w"] = True
+        return (True, "")
+    monkeypatch.setattr(auth, "verify_hf_write", _w)
+    fake = Fake()
+    _wire(monkeypatch, fake)
+    job = Job(name="t", entrypoint="x", secrets=["HF_TOKEN"])
+    orchestrator.run(job, max_rounds=1)
+    assert not called["w"]
 
 
 def test_preflight_skipped_when_hf_not_needed(monkeypatch):

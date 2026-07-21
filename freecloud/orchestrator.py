@@ -30,19 +30,33 @@ def _preflight(job: Job) -> dict | None:
     데이터셋 업로드·쿼터·원격 부팅을 낭비한 뒤 커널 깊숙이서 죽는 대신, dispatch 前에
     빠르게 실패시키고 사람이 읽을 조치를 준다. HF는 whoami로 실검증."""
     from . import secrets
-    from .auth import verify_hf_token
+    from .auth import verify_hf_token, verify_hf_write
+
+    def _fail(detail: str, suffix: str = "") -> dict:
+        reason = f"프리플라이트 실패(HF): {detail}{suffix}"
+        print(f"[orch] {reason}", flush=True)
+        return dict(ok=False, provider=None, reason=reason,
+                    attempts=[dict(provider="(preflight)", ok=False,
+                                   error_class="AUTH", reason=detail)])
+
     needs_hf = bool(job.checkpoint_repo) or any(
         s in ("HF_TOKEN", "HUGGINGFACE_TOKEN") for s in (job.secrets or []))
-    if needs_hf:
-        tok = secrets.get("HF_TOKEN") or secrets.get("HUGGINGFACE_TOKEN")
-        ok, detail = verify_hf_token(tok)
+    if not needs_hf:
+        return None
+
+    tok = secrets.get("HF_TOKEN") or secrets.get("HUGGINGFACE_TOKEN")
+    ok, detail = verify_hf_token(tok)
+    if not ok:
+        return _fail(detail, " — `fcc login huggingface`로 갱신 후 재실행."
+                             " (체크포인트/게이티드 모델에 HF 토큰 필요.)")
+
+    # ⚠️ whoami 통과 ≠ 쓰기 가능. 체크포인트를 쓸 job 이면 실제 쓰기까지 확인한다 —
+    #    안 그러면 런이 다 끝나갈 무렵 push 에서 401 이 나고 쿼터를 날린다.
+    if job.checkpoint_repo:
+        ok, wdetail = verify_hf_write(job.checkpoint_repo, tok)
         if not ok:
-            reason = (f"프리플라이트 실패(HF): {detail} — `freecloud login huggingface`로 "
-                      f"갱신 후 재실행. (체크포인트/게이티드 모델에 HF 토큰 필요.)")
-            print(f"[orch] {reason}", flush=True)
-            return dict(ok=False, provider=None, reason=reason,
-                        attempts=[dict(provider="(preflight)", ok=False,
-                                       error_class="AUTH", reason=detail)])
+            return _fail(wdetail)
+        print(f"[orch] 프리플라이트 OK: {detail} / {wdetail}", flush=True)
     return None
 
 

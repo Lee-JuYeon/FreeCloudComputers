@@ -24,12 +24,17 @@ from ..job import Job
 from .base import Probe, RunResult
 from .kaggle import KaggleProvider
 
-_HOME = os.environ.get("FREECLOUD_HOME", os.path.join(os.getcwd(), ".freecloud"))
-STATE_PATH = os.environ.get("FREECLOUD_KAGGLE_STATE",
-                            os.path.join(_HOME, "kaggle_state.json"))
-# 실제 Chrome 프로필 — Google이 번들 Chromium 로그인을 차단하므로 영속 프로필 사용.
-PROFILE_DIR = os.environ.get("FREECLOUD_KAGGLE_PROFILE",
-                             os.path.join(_HOME, "chrome_profile"))
+from .. import paths
+
+
+def _state_path() -> str:
+    """로그인 세션 파일 — 사용자 전역(paths.py). 실행 디렉토리와 무관하게 같은 로그인을 쓴다."""
+    return os.environ.get("FREECLOUD_KAGGLE_STATE") or paths.user_file("kaggle_state.json")
+
+
+def _profile_dir() -> str:
+    """실제 Chrome 프로필 — Google이 번들 Chromium 로그인을 차단하므로 영속 프로필 사용."""
+    return os.environ.get("FREECLOUD_KAGGLE_PROFILE") or paths.user_file("chrome_profile")
 
 
 def _cookie_says_anon(cookies) -> bool | None:
@@ -53,9 +58,10 @@ def _cookie_says_anon(cookies) -> bool | None:
     return None
 
 
-def session_is_logged_in(path: str = STATE_PATH) -> tuple[bool, str]:
+def session_is_logged_in(path: str | None = None) -> tuple[bool, str]:
     """저장된 storage_state가 '실제 로그인된' 세션인지 → (ok, detail)."""
     import json
+    path = path or _state_path()
     if not os.path.exists(path):
         return False, f"로그인 상태 없음 → 'fcc kaggle-login' 실행({path})."
     try:
@@ -91,7 +97,7 @@ class KaggleUIProvider(KaggleProvider):
             return Probe(False, "playwright 미설치(pip install 'freecloud[kaggle-ui]' && playwright install chromium).")
         # ⚠️ 파일 존재만 보면 '익명 세션'이 통과해 실패가 AUTH가 아닌 UI_AUTOMATION으로
         #    오분류된다(실측 2026-07-20). 세션 내용까지 검사한다.
-        ok, detail = session_is_logged_in(STATE_PATH)
+        ok, detail = session_is_logged_in(_state_path())
         if not ok:
             return Probe(False, detail)
         return Probe(True, "kaggle-ui 준비 OK(Playwright + 저장된 로그인).")
@@ -99,7 +105,7 @@ class KaggleUIProvider(KaggleProvider):
     def run(self, job: Job) -> RunResult:
         if self._pw() is None:
             return RunResult(False, "error", "playwright 미설치.", error_class="JOB_CONFIG")
-        ok, detail = session_is_logged_in(STATE_PATH)
+        ok, detail = session_is_logged_in(_state_path())
         if not ok:
             return RunResult(False, "needs_setup", f"kaggle-login 선행 필요: {detail}",
                              error_class="AUTH")
@@ -128,7 +134,7 @@ class KaggleUIProvider(KaggleProvider):
 
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=not headful)
-            ctx = browser.new_context(storage_state=STATE_PATH)
+            ctx = browser.new_context(storage_state=_state_path())
             page = ctx.new_page()
             try:
                 # ⚠️ networkidle 금지 — Kaggle 에디터는 웹소켓/폴링이 상시 열려 있어
@@ -251,8 +257,8 @@ def save_login_state(headful: bool = True, timeout_s: int = 300) -> str:
         from playwright.sync_api import sync_playwright
     except ImportError:
         raise SystemExit("pip install 'freecloud[kaggle-ui]' && playwright install chromium")
-    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    os.makedirs(PROFILE_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(_state_path()), exist_ok=True)
+    os.makedirs(_profile_dir(), exist_ok=True)
 
     with sync_playwright() as p:
         ctx = None
@@ -261,14 +267,14 @@ def save_login_state(headful: bool = True, timeout_s: int = 300) -> str:
         for channel in ("chrome", "msedge", None):
             try:
                 ctx = p.chromium.launch_persistent_context(
-                    PROFILE_DIR,
+                    _profile_dir(),
                     headless=False,  # 로그인은 반드시 headful
                     channel=channel,
                     args=["--disable-blink-features=AutomationControlled"],
                     ignore_default_args=["--enable-automation"],
                 )
                 if channel:
-                    print(f"브라우저: 실제 {channel} + 영속 프로필({PROFILE_DIR})")
+                    print(f"브라우저: 실제 {channel} + 영속 프로필({_profile_dir()})")
                 else:
                     print("⚠ 실제 Chrome/Edge를 못 찾아 번들 Chromium 사용 — Google이 차단할 수 있음.")
                 break
@@ -295,14 +301,14 @@ def save_login_state(headful: bool = True, timeout_s: int = 300) -> str:
             except Exception:
                 pass  # 페이지 전환 중 일시적 실패는 무시하고 계속 폴링
 
-        ctx.storage_state(path=STATE_PATH)
+        ctx.storage_state(path=_state_path())
         ctx.close()
 
     # ⚠️ Windows 콘솔(cp949)은 이모지를 못 찍는다 — 여기서 UnicodeEncodeError로 죽으면
     #    로그인이 성공했는데도 실패처럼 보인다(실측 2026-07-20). CLI 출력은 ASCII로.
     if ok:
-        print(f"[OK] 로그인 확인 + 상태 저장됨 -> {STATE_PATH}")
+        print(f"[OK] 로그인 확인 + 상태 저장됨 -> {_state_path()}")
     else:
         print(f"[FAIL] {timeout_s}초 내 로그인 감지 실패 - 저장은 했지만 미로그인 상태일 수 있음 "
-              f"({STATE_PATH}). 'fcc providers'로 확인하세요.")
-    return STATE_PATH
+              f"({_state_path()}). 'fcc providers'로 확인하세요.")
+    return _state_path()
