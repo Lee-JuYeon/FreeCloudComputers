@@ -81,6 +81,27 @@ def _require_interactive(what: str, env_hint: str = "") -> None:
     raise SystemExit("\n".join(lines))
 
 
+def _warn_if_env_shadows(name: str, stored: str) -> None:
+    """저장한 값이 환경변수에 가려지면 크게 경고한다.
+
+    secrets.get() 은 'env 우선, 없으면 저장소'다. 그래서 만료된 토큰이 env 에 영구 설정돼
+    있으면, 새 토큰을 저장해도 계속 낡은 값이 쓰인다 — 로그인은 성공한 것처럼 보이는데
+    실제 사용은 계속 실패하는, 알아채기 매우 어려운 상태가 된다(실측 2026-07-21).
+    """
+    env_val = os.environ.get(name)
+    if not env_val or env_val.strip() == stored.strip():
+        return
+    print()
+    print(f"⚠ 경고: 환경변수 {name} 이(가) 방금 저장한 값과 다릅니다.")
+    print(f"  secrets 는 env 를 우선하므로, 이대로면 저장한 토큰이 아니라 env 값이 쓰입니다.")
+    print(f"  env 값을 지우세요:")
+    print(f"    PowerShell(현재 세션):  $env:{name}=$null")
+    print(f"    PowerShell(영구):       [Environment]::SetEnvironmentVariable('{name}', $null, 'User')")
+    print(f"    bash:                   unset {name}")
+    print(f"  (지운 뒤 새 터미널에서 `fcc auth` 로 확인하세요.)")
+    print()
+
+
 def _from_env(*names: str) -> str | None:
     for n in names:
         v = os.environ.get(n)
@@ -114,8 +135,20 @@ def _mirror_hf_cache(tok: str) -> str | None:
 
 def login_huggingface() -> None:
     """write 토큰을 붙여넣기 받아 whoami로 검증 후 저장 + 표준 HF 캐시에 미러."""
-    # env에 이미 있으면 프롬프트 없이 검증·저장 — 무인 경로.
+    # env에 있으면 먼저 시도(무인 경로). ⚠️ 단, 만료·무효면 여기서 끝내지 않는다 —
+    #    그러면 만료 토큰이 env에 남아있는 사람은 새 토큰을 넣을 기회조차 없다(실측).
     tok = _from_env("HF_TOKEN", "HUGGINGFACE_TOKEN")
+    if tok:
+        ok, detail = verify_hf_token(tok)
+        if ok:
+            secrets.set("HF_TOKEN", tok)
+            _mirror_hf_cache(tok)
+            print(f"env 토큰이 유효합니다 — 저장 완료. {detail}")
+            return
+        print(f"env 의 HF 토큰이 무효합니다: {detail}")
+        print("→ 새 토큰을 입력받겠습니다.")
+        tok = None
+
     if not tok:
         _require_interactive("HF 토큰 입력", "HF_TOKEN=hf_xxx fcc login huggingface")
         print("HF write 토큰을 발급하세요: https://huggingface.co/settings/tokens (Type: Write)")
@@ -126,6 +159,7 @@ def login_huggingface() -> None:
     if not ok:
         print(f"토큰 검증 실패(저장 안 함): {detail}"); return
     secrets.set("HF_TOKEN", tok)
+    _warn_if_env_shadows("HF_TOKEN", tok)
     if _mirror_hf_cache(tok):
         print("표준 HF 캐시(~/.cache/huggingface/token)에도 미러 — 외부 런처도 이 토큰 사용.")
     print(f"저장 완료 — {detail}")

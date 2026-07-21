@@ -61,3 +61,33 @@ def test_prompt_secret_자체가_비대화형을_막는다(noninteractive):
 def test_대화형이면_가드가_통과한다(monkeypatch):
     monkeypatch.setattr(auth, "interactive_available", lambda: True)
     auth._require_interactive("무언가")  # 예외 없어야 함
+
+
+def test_env토큰이_무효면_프롬프트로_넘어간다(monkeypatch, capsys):
+    """회귀: 만료 토큰이 env 에 남아 있으면 새 토큰을 넣을 기회조차 없었다."""
+    monkeypatch.setattr(auth, "interactive_available", lambda: True)
+    monkeypatch.setenv("HF_TOKEN", "hf_expired")
+    monkeypatch.setattr(auth, "verify_hf_token",
+                        lambda t: (t == "hf_new", "무효" if t != "hf_new" else "OK"))
+    monkeypatch.setattr(auth, "_prompt_secret", lambda p: "hf_new")
+    monkeypatch.setattr(auth, "_mirror_hf_cache", lambda t: None)
+    stored = {}
+    monkeypatch.setattr(auth.secrets, "set", lambda k, v: stored.__setitem__(k, v))
+
+    auth.login_huggingface()
+
+    assert stored["HF_TOKEN"] == "hf_new", "무효 env 토큰에서 멈추면 안 된다"
+
+
+def test_env가_저장값을_가리면_경고한다(monkeypatch, capsys):
+    """secrets.get 은 env 우선 — 낡은 env 가 새 토큰을 조용히 가리는 걸 알려야 한다."""
+    monkeypatch.setenv("HF_TOKEN", "hf_stale")
+    auth._warn_if_env_shadows("HF_TOKEN", "hf_new")
+    out = capsys.readouterr().out
+    assert "경고" in out and "HF_TOKEN" in out
+
+
+def test_env가_같으면_경고하지_않는다(monkeypatch, capsys):
+    monkeypatch.setenv("HF_TOKEN", "hf_same")
+    auth._warn_if_env_shadows("HF_TOKEN", "hf_same")
+    assert capsys.readouterr().out == ""
