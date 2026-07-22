@@ -15,7 +15,8 @@ def test_verify_hf_token_none():
 
 
 def test_verify_hf_token_invalid(monkeypatch):
-    import huggingface_hub
+    # 라이브러리가 있어야 의미 있는 테스트 — 없는 환경에선 skip(에러 아님).
+    huggingface_hub = pytest.importorskip("huggingface_hub")
     def _boom(self, token=None):
         raise RuntimeError("Invalid user token")
     monkeypatch.setattr(huggingface_hub.HfApi, "whoami", _boom)
@@ -24,11 +25,30 @@ def test_verify_hf_token_invalid(monkeypatch):
 
 
 def test_verify_hf_token_valid(monkeypatch):
-    import huggingface_hub
+    huggingface_hub = pytest.importorskip("huggingface_hub")
     monkeypatch.setattr(huggingface_hub.HfApi, "whoami",
                         lambda self, token=None: {"name": "tester"})
     ok, detail = auth.verify_hf_token("hf_good")
     assert ok and "tester" in detail
+
+
+def test_verify_hf_token_hub_미설치면_무효로_보지_않는다(monkeypatch):
+    """CI 가 드러낸 분기 — huggingface_hub 이 없다고 토큰을 '무효'로 단정하면 안 된다.
+
+    로컬 검증이 불가할 뿐이고 원격 노드에는 설치돼 있을 수 있다. 여기서 False 를 주면
+    멀쩡한 토큰으로도 프리플라이트가 런을 막아버린다.
+    """
+    import builtins
+    real_import = builtins.__import__
+
+    def _no_hub(name, *a, **k):
+        if name == "huggingface_hub":
+            raise ImportError("no huggingface_hub")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _no_hub)
+    ok, detail = auth.verify_hf_token("hf_whatever")
+    assert ok and "미설치" in detail
 
 
 # ── ~/.cache 미러 ────────────────────────────────────────────────────────────
