@@ -29,6 +29,7 @@ class ModalProvider(Provider):
 
     def run(self, job: Job) -> RunResult:
         gpu = job.needs.get("gpu", "T4")
+        self.warn_unfetched(job, self.name)
         work = tempfile.mkdtemp(prefix="fc-modal-")
         runner = os.path.join(work, "runner.py")
         envs = job.resolved_env()

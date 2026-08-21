@@ -59,8 +59,8 @@ class LightningProvider(Provider):
         mname = os.environ.get("FREECLOUD_LIGHTNING_MACHINE", "T4")
         machine = getattr(Machine, mname, mname)
         # env export 를 명령 앞에 붙여 원격에 주입(체크포인트 repo 등)
-        cmd = " ".join(f"export {k}={v};" for k, v in job.resolved_env().items()) \
-            + " " + job.entrypoint
+        cmd = self.export_prefix(job.resolved_env()) + job.entrypoint
+        self.warn_unfetched(job, self.name)
 
         try:
             studio_name = os.environ.get("LIGHTNING_STUDIO", f"fc-{job.name}")[:40]
@@ -77,8 +77,24 @@ class LightningProvider(Provider):
 
     def _poll(self, lj, job: Job) -> RunResult:
         deadline = time.time() + job.max_runtime_s
+        blind = 0                       # status 를 못 읽은 연속 횟수
         while time.time() < deadline:
-            status = str(getattr(lj, "status", "")).lower()
+            try:
+                status = str(getattr(lj, "status", "")).lower()
+            except Exception as e:      # SDK 세션 만료 등
+                status, e_txt = "", str(e)
+            else:
+                e_txt = ""
+            if not status:
+                # 상태를 계속 못 읽으면 max_runtime_s 를 통째로 태운다(과거 동작).
+                # 20회(≈10분) 연속이면 세션이 죽은 것으로 보고 페일오버시킨다.
+                blind += 1
+                if blind >= 20:
+                    return RunResult(False, "error",
+                                     "Lightning 상태 조회 불가(10분 연속) — 세션 유실로 판단.",
+                                     e_txt[-400:], "SESSION_LOST")
+                time.sleep(30); continue
+            blind = 0
             if any(s in status for s in ("completed", "success", "finished")):
                 return RunResult(True, "done", "Lightning Job 완료.")
             if any(s in status for s in ("failed", "error", "stopped")):

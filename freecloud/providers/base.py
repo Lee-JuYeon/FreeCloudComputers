@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import re
+import shlex
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -74,7 +76,36 @@ class Provider(ABC):
             return False, f"{self.name}: GPU '{cap_gpu}' — '{need_gpu}' 요구 불충족"
         return True, ""
 
+
     # ── 공용 헬퍼 ────────────────────────────────────────────────────────────
+    @staticmethod
+    def export_prefix(env: dict) -> str:
+        """원격 셸에 env 를 주입하는 접두사. **반드시 인용한다.**
+
+        과거: `" ".join(f"export {k}={v};")` — 값에 공백·$·;·따옴표가 있으면
+        명령이 깨지거나 주입된다. resolved_env() 에는 HF_TOKEN 같은 시크릿이
+        들어오므로 값 형태를 통제할 수 없다 → shlex.quote 필수.
+        (kaggle 은 커널 스크립트에 넣고 is_private 로 막는다 — 그쪽이 더 안전한 축)
+        """
+        return "".join(f"export {k}={shlex.quote(str(v))}; "
+                       for k, v in env.items() if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k))
+
+    @staticmethod
+    def warn_unfetched(job, provider: str) -> str:
+        """artifacts 를 회수하지 못하는 provider 가 **조용히 넘어가지 않게** 한다.
+
+        job.artifacts 는 '회수할 원격 경로들'로 선언돼 있는데 colab 외 어댑터는
+        이를 아예 읽지 않았다. 사용자는 파일이 생긴 줄 알고 기다린다.
+        회수 경로가 생기기 전까지는 최소한 **말은 해야** 한다.
+        """
+        if not getattr(job, "artifacts", None):
+            return ""
+        msg = (f"[{provider}] artifacts 미회수: {', '.join(job.artifacts)} — "
+               f"이 어댑터는 원격 파일 회수를 아직 지원하지 않는다. "
+               f"entrypoint 안에서 HF Hub 등으로 직접 업로드할 것.")
+        print(msg, flush=True)
+        return msg
+
     @staticmethod
     def _sh(cmd: list[str], timeout: int, env: Optional[dict] = None,
             cwd: Optional[str] = None) -> tuple[int, str]:

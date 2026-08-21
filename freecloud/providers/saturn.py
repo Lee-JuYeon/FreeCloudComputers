@@ -48,8 +48,8 @@ class SaturnProvider(Provider):
         if conn is None:
             return RunResult(False, "error", "saturn-client/토큰 없음.", error_class="AUTH")
         # env export 를 command 앞에 붙여 시크릿/체크포인트 주입
-        cmd = " ".join(f"export {k}={v};" for k, v in job.resolved_env().items()) \
-            + " " + job.entrypoint
+        cmd = self.export_prefix(job.resolved_env()) + job.entrypoint
+        self.warn_unfetched(job, self.name)
         recipe = {
             "type": "job", "spec": {
                 "name": f"fc-{job.name}"[:40],
@@ -70,11 +70,17 @@ class SaturnProvider(Provider):
 
     def _poll(self, conn, rid: str, job: Job) -> RunResult:
         deadline = time.time() + job.max_runtime_s
+        blind = 0                       # 상태 조회 연속 실패
         while time.time() < deadline:
             try:
                 st = str(conn.get_job(rid).get("status", "")).lower()
-            except Exception:
-                st = ""
+                blind = 0
+            except Exception as e:
+                st, blind = "", blind + 1
+                if blind >= 20:         # ≈10분 — 조용히 타임아웃까지 가지 않게
+                    return RunResult(False, "error",
+                                     "Saturn 상태 조회 불가(10분 연속) — 세션 유실로 판단.",
+                                     str(e)[-400:], "SESSION_LOST")
             if any(s in st for s in ("completed", "success")):
                 return RunResult(True, "done", "Saturn Job 완료.")
             if any(s in st for s in ("failed", "error")):

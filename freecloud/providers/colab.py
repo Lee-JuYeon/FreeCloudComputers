@@ -31,10 +31,24 @@ class ColabProvider(Provider):
         return base + list(args)
 
     def probe(self) -> Probe:
+        """CLI 생존 + **인증까지** 확인한다.
+
+        ⚠️ 과거 버그(kaggle 과 동일): rc==127 만 걸러내고 rc!=0(로그인 만료, WSL 실패,
+        타임아웃)은 그대로 True 로 통과시켰다. probe 가 OK 라 해놓고 run 에서 죽는다.
+        거짓 양성은 페일오버를 망친다 — 오케스트레이터가 멀쩡한 provider 를 놔두고
+        죽은 provider 를 고르기 때문이다.
+        """
         rc, log = self._sh(self._cmd("sessions"), 60)
         if rc == 127:
             return Probe(False, "colab CLI 미설치/미가용(WSL 필요할 수 있음).")
-        # 슬롯 점유 여부는 run()의 대기 로직에서 처리. 여기선 CLI 생존만 확인.
+        if rc == 124:
+            return Probe(False, "colab sessions 응답 없음(60s 초과).", cooldown_s=300)
+        if rc != 0:
+            low = (log or "").lower()
+            if any(k in low for k in ("auth", "login", "credential", "401", "403", "unauthor")):
+                return Probe(False, "colab 인증 만료 — `freecloud login colab` 다시 실행.")
+            return Probe(False, f"colab sessions 실패(rc={rc}): {(log or '')[-160:].strip()}")
+        # 슬롯 점유 여부는 run()의 대기 로직에서 처리.
         return Probe(True, "colab CLI OK.")
 
     def run(self, job: Job) -> RunResult:
@@ -44,6 +58,9 @@ class ColabProvider(Provider):
         # [C] 슬롯 폴링(우리 세션 있으면 즉시 진행)
         for i in range(int(os.environ.get("COLAB_WAIT_TRIES", "40"))):
             rc, s = self._sh(self._cmd("sessions"), 30)
+            if rc != 0:                                 # 조회 자체가 실패 — 빈 걸로 오독 금지
+                return RunResult(False, "error", f"colab sessions 조회 실패(rc={rc}).",
+                                 (s or "")[-400:], "AUTH")
             if sess in s:
                 break                                   # [B] 재사용
             if "Hardware:" not in s and "Variant:" not in s:
@@ -66,8 +83,7 @@ class ColabProvider(Provider):
             started = True
 
             # entrypoint 실행. 체크포인트 pull/push는 entrypoint 내부 책임.
-            envflags = " ".join(f"{k}={v}" for k, v in job.resolved_env().items())
-            remote = f"{envflags} {job.entrypoint}".strip()
+            remote = (self.export_prefix(job.resolved_env()) + job.entrypoint).strip()
             rc, log = self._sh(self._cmd("exec", "-s", sess, "-c", remote), job.max_runtime_s)
 
             for path in job.artifacts:                  # 부분이라도 per-file 회수
