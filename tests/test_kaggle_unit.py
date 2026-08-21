@@ -74,3 +74,62 @@ def test_auth_hint_classifies():
     assert "403" in kaggle_auth_hint("HTTP 403 Forbidden")
     assert "429" in kaggle_auth_hint("429 Too Many Requests")
     assert "원인 불명" in kaggle_auth_hint("")
+
+
+# ── OAuth 토큰 자동 주입 (2026-08-21) ────────────────────────────────────────
+# `kaggle auth login` 은 ~/.kaggle/credentials.json 을 만들지만 CLI 2.2.x 가
+# kernels 계열에서 이 파일을 자동으로 읽지 않는다(실측: 로그인 직후에도 거절).
+# fcc 가 access_token 을 KAGGLE_API_TOKEN 으로 넣어 메운다.
+def _write_creds(tmp_path, monkeypatch, token="tok-abc", exp=None):
+    import json as _j, datetime as _dt
+    if exp is None:
+        exp = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(hours=1)).isoformat()
+    d = tmp_path / ".kaggle"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "credentials.json").write_text(_j.dumps(
+        {"refresh_token": "r", "access_token": token,
+         "access_token_expiration": exp, "username": "someone", "scopes": []}))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    return d
+
+
+def test_oauth_token_read(tmp_path, monkeypatch):
+    from freecloud.providers import kaggle as K
+    _write_creds(tmp_path, monkeypatch)
+    assert K.oauth_access_token() == "tok-abc"
+
+
+def test_oauth_token_expired_returns_empty(tmp_path, monkeypatch):
+    import datetime as dt
+    from freecloud.providers import kaggle as K
+    past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
+    _write_creds(tmp_path, monkeypatch, exp=past)
+    assert K.oauth_access_token() == ""
+
+
+def test_sh_injects_token(tmp_path, monkeypatch):
+    from freecloud.providers.kaggle import KaggleProvider
+    from freecloud.providers import base
+    _write_creds(tmp_path, monkeypatch, token="INJECTED")
+    monkeypatch.delenv("KAGGLE_API_TOKEN", raising=False)
+    seen = {}
+
+    def fake(cmd, timeout, env=None, cwd=None):
+        seen.update(env or {})
+        return 0, "ok"
+    monkeypatch.setattr(base.Provider, "_sh", staticmethod(fake))
+    KaggleProvider()._sh(["kaggle", "kernels", "list"], 10, {"PYTHONUTF8": "1"})
+    assert seen.get("KAGGLE_API_TOKEN") == "INJECTED"
+    assert seen.get("PYTHONUTF8") == "1"      # 기존 env 를 지우면 안 된다
+
+
+def test_sh_does_not_override_existing_env_token(tmp_path, monkeypatch):
+    from freecloud.providers.kaggle import KaggleProvider
+    from freecloud.providers import base
+    _write_creds(tmp_path, monkeypatch, token="FROM_FILE")
+    monkeypatch.setenv("KAGGLE_API_TOKEN", "FROM_ENV")
+    seen = {}
+    monkeypatch.setattr(base.Provider, "_sh",
+                        staticmethod(lambda c, t, env=None, cwd=None: (seen.update(env or {}), (0, "ok"))[1]))
+    KaggleProvider()._sh(["kaggle", "x"], 10)
+    assert "KAGGLE_API_TOKEN" not in seen     # 이미 있으면 건드리지 않는다

@@ -139,8 +139,14 @@ Apache-2.0
 로 거절된다(2026-08-21 실측: `kaggle.json`·`access_token` 이 둘 다 있는 머신에서도 거절).
 
 ```bash
-kaggle auth login          # 권장 — 브라우저 OAuth, 1회. 토큰 자동 캐시
+kaggle auth login          # 권장 — 브라우저 OAuth, 1회
 ```
+
+> **알아둘 것**: `kaggle auth login` 은 `~/.kaggle/credentials.json` 을 만들지만
+> **CLI 2.2.x 는 이 파일을 `kernels` 계열 명령에서 자동으로 읽지 않는다.**
+> 로그인 직후에도 `Authentication required` 가 뜬다(2026-08-21 실측, CLI 2.2.4에서도 동일).
+> `freecloud` 는 이 파일의 `access_token` 을 `KAGGLE_API_TOKEN` 으로 자동 주입해 메운다 —
+> 사용자가 손으로 export 할 필요 없다. 만료되면 다시 로그인하라고 안내한다.
 
 비대화형(CI 등)이면 [kaggle.com/settings/api](https://www.kaggle.com/settings/api) 에서
 새 토큰을 발급해 둘 중 하나로 넣는다:

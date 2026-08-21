@@ -27,15 +27,35 @@ class KaggleProvider(Provider):
                     "note": "API는 단일 GPU(기본 P100). T4x2는 kaggle-ui(Playwright)로."}
 
     # ── 공용 헬퍼(kaggle-ui가 재사용) ────────────────────────────────────────
+    def _sh(self, cmd, timeout, env=None, cwd=None):
+        """kaggle CLI 호출 전 OAuth 토큰을 환경변수로 주입한다.
+
+        `kaggle auth login`(OAuth)은 ~/.kaggle/credentials.json 을 만들지만
+        **CLI 2.2.x 가 이 파일을 kernels 계열 명령에서 자동으로 읽지 않는다**
+        (2026-08-21 실측: 로그인 직후에도 "Authentication required").
+        같은 파일의 access_token 을 KAGGLE_API_TOKEN 으로 넣어주면 즉시 통과한다.
+        → 사용자에게 수동 export 를 요구하지 않고 여기서 메운다.
+        """
+        merged = dict(env or {})
+        if cmd and cmd[0] == "kaggle" and not os.environ.get("KAGGLE_API_TOKEN"):
+            tok = oauth_access_token()
+            if tok:
+                merged["KAGGLE_API_TOKEN"] = tok
+        return super()._sh(cmd, timeout, merged, cwd)
+
     def _user(self) -> str:
         if os.environ.get("KAGGLE_USERNAME"):
             return os.environ["KAGGLE_USERNAME"]
-        kj = os.path.expanduser("~/.kaggle/kaggle.json")
-        if os.path.exists(kj):
-            try:
-                return json.load(open(kj)).get("username", "")
-            except Exception:
-                pass
+        for path, key in ((("~/.kaggle/credentials.json"), "username"),
+                          (("~/.kaggle/kaggle.json"), "username")):
+            fp = os.path.expanduser(path)
+            if os.path.exists(fp):
+                try:
+                    v = json.load(open(fp)).get(key, "")
+                    if v:
+                        return v
+                except Exception:
+                    pass
         return ""
 
     def kernel_slug(self, job: Job) -> str:
@@ -139,6 +159,30 @@ class KaggleProvider(Provider):
             return RunResult(False, "error", d.advice, log[-1200:], d.error_class)
         return self._poll_and_fetch(job, work)
 
+
+
+def oauth_access_token() -> str:
+    """`kaggle auth login` 이 남긴 OAuth access_token. 만료면 빈 문자열.
+
+    구조: {refresh_token, access_token, access_token_expiration, username, scopes}
+    """
+    fp = os.path.expanduser("~/.kaggle/credentials.json")
+    if not os.path.exists(fp):
+        return ""
+    try:
+        d = json.load(open(fp))
+    except Exception:
+        return ""
+    exp = str(d.get("access_token_expiration", ""))
+    if exp:
+        try:
+            from datetime import datetime, timezone
+            t = datetime.fromisoformat(exp.replace("Z", "+00:00"))
+            if t <= datetime.now(timezone.utc):
+                return ""          # 만료 → probe 가 재로그인 안내를 내도록
+        except Exception:
+            pass
+    return str(d.get("access_token", "") or "")
 
 
 def kaggle_auth_hint(log: str) -> str:
