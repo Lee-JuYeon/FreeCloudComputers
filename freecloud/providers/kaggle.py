@@ -116,12 +116,18 @@ class KaggleProvider(Provider):
 
     # ── 인터페이스 ───────────────────────────────────────────────────────────
     def probe(self) -> Probe:
-        if not self._user():
-            return Probe(False, "~/.kaggle/kaggle.json 없음(KAGGLE_USERNAME 미설정).")
+        """실제 API 호출 결과까지 본다.
+
+        ⚠️ 과거 버그: rc==127(CLI 부재)만 검사하고 rc!=0(인증 실패)은 그냥 통과시켜
+        `fcc auth` 가 "kaggle 인증 OK" 라 답한 뒤 `fcc run` 이 AUTH 로 죽었다.
+        probe 는 '붙는다'를 보장해야 의미가 있다 — 거짓 양성은 없느니만 못하다.
+        """
         rc, log = self._sh(["kaggle", "kernels", "list", "-m", "--page-size", "1"], 60, _UTF8)
         if rc == 127:
             return Probe(False, "kaggle CLI 미설치(pip install kaggle).")
-        return Probe(True, "kaggle 인증 OK.")
+        if rc == 0:
+            return Probe(True, f"kaggle 인증 OK{(' (' + self._user() + ')') if self._user() else ''}.")
+        return Probe(False, kaggle_auth_hint(log))
 
     def run(self, job: Job) -> RunResult:
         if not self._user():
@@ -133,6 +139,28 @@ class KaggleProvider(Provider):
             return RunResult(False, "error", d.advice, log[-1200:], d.error_class)
         return self._poll_and_fetch(job, work)
 
+
+
+def kaggle_auth_hint(log: str) -> str:
+    """kaggle CLI 실패 로그 → 사람이 바로 실행할 수 있는 한 줄 안내.
+
+    kaggle CLI 2.2.x 부터 인증 방식이 바뀌었다. 예전 `~/.kaggle/kaggle.json`
+    (username+key)만 있으면 되던 것이 이제 OAuth 또는 단일 API 토큰을 요구하고,
+    kaggle.json 이 있어도 "Authentication required" 로 거절한다.
+    실측(2026-08-21): kaggle.json·access_token 이 둘 다 있는데도 거절 → 재로그인 필요.
+    """
+    low = (log or "").lower()
+    if "authentication required" in low or "401" in low or "unauthorized" in low:
+        return ("kaggle 인증 만료/불일치 — `kaggle auth login`(브라우저 OAuth) 으로 재로그인하라. "
+                "비대화형이면 kaggle.com/settings/api 에서 새 토큰을 받아 "
+                "KAGGLE_API_TOKEN 환경변수 또는 ~/.kaggle/access_token 에 넣는다. "
+                "※ CLI 2.2+ 는 예전 kaggle.json(username+key)만으로는 통과하지 않는다.")
+    if "403" in low or "forbidden" in low:
+        return "kaggle 권한 거부(403) — 계정 상태/전화 인증(Phone verification) 확인 필요."
+    if "429" in low or "too many requests" in low:
+        return "kaggle 요청 과다(429) — 잠시 후 재시도."
+    tail = (log or "").strip().splitlines()
+    return "kaggle CLI 실패: " + (tail[-1][:160] if tail else "원인 불명")
 
 # 커널 안에서 실행되는 래퍼: env(시크릿) 주입 + 실제 GPU(nvidia-smi)·예외를 diag.txt에 남긴다.
 # str.format을 쓰지 않는다(env dict의 중괄호가 깨짐) — json.dumps + %r 로 안전하게 삽입.

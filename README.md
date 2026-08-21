@@ -131,3 +131,24 @@ v0.1 — CLI 코어 + 4 어댑터 + 체크포인트 + MCP 래퍼 스캐폴드. p
 ## 라이선스
 
 Apache-2.0
+
+### Kaggle 인증 (CLI 2.2+ 에서 바뀌었다)
+
+`kaggle` CLI 2.2.x 부터 인증 방식이 바뀌어 **예전 `~/.kaggle/kaggle.json`
+(username+key) 만으로는 통과하지 않는다.** 파일이 있어도 `Authentication required`
+로 거절된다(2026-08-21 실측: `kaggle.json`·`access_token` 이 둘 다 있는 머신에서도 거절).
+
+```bash
+kaggle auth login          # 권장 — 브라우저 OAuth, 1회. 토큰 자동 캐시
+```
+
+비대화형(CI 등)이면 [kaggle.com/settings/api](https://www.kaggle.com/settings/api) 에서
+새 토큰을 발급해 둘 중 하나로 넣는다:
+
+```bash
+export KAGGLE_API_TOKEN=xxxxxxxx      # A) 환경변수
+echo "xxxxxxxx" > ~/.kaggle/access_token   # B) 파일
+```
+
+`fcc auth` 는 이제 **실제 API 호출 결과까지 확인**한다. 예전에는 CLI 존재 여부만 보고
+"인증 OK" 라 답한 뒤 `fcc run` 이 AUTH 로 죽는 거짓 양성이 있었다 — 수정됨.

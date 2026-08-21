@@ -199,7 +199,20 @@ def login_huggingface() -> None:
 
 
 def login_kaggle() -> None:
-    """~/.kaggle/kaggle.json 안내 + KAGGLE_KEY 저장 옵션."""
+    """kaggle 인증 안내.
+
+    ⚠️ kaggle CLI 2.2.x 부터 인증이 바뀌었다. 예전 ~/.kaggle/kaggle.json
+    (username+key)만으로는 "Authentication required" 로 거절당한다.
+    실측(2026-08-21): kaggle.json·access_token 이 둘 다 있는 머신에서도 거절.
+    → 권장: `kaggle auth login` (브라우저 OAuth, 토큰 자동 캐시)
+       비대화형: kaggle.com/settings/api 새 토큰 → KAGGLE_API_TOKEN 또는
+                 ~/.kaggle/access_token
+    """
+    print("Kaggle 인증(CLI 2.2+):")
+    print("  1) 권장  : kaggle auth login       # 브라우저 OAuth, 1회")
+    print("  2) 비대화: kaggle.com/settings/api → 토큰 발급 →")
+    print("             export KAGGLE_API_TOKEN=... 또는 ~/.kaggle/access_token 에 저장")
+    print("  ※ 예전 kaggle.json(username+key)만으로는 통과하지 않는다.")
     kj = os.path.expanduser("~/.kaggle/kaggle.json")
     if os.path.exists(kj):
         print(f"이미 있음: {kj} — 그대로 사용됩니다.")
