@@ -1,6 +1,7 @@
 """cli — `freecloud` 진입점.
 
-  freecloud run job.yaml [--once] [--providers a,b] [--dry-run]
+  freecloud run job.yaml [--once] [--providers a,b] [--dry-run] [--quiet]
+  freecloud logs job.yaml        # 커널 상태 + diag/로그 꼬리 + 산출물 회수
   freecloud providers            # 등록된 provider + probe 상태
   freecloud status               # 쿨다운 스냅샷
   freecloud clouds               # 지원/후보 무료 클라우드 카탈로그
@@ -8,12 +9,39 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
+import os
 import sys
 
 from . import registry, state
 from .job import Job
 from . import orchestrator
+
+
+#: 실패 로그를 얼마나 보여줄지. 40줄이면 대개 Traceback 전체가 들어온다.
+LOG_TAIL_LINES = 40
+
+
+def print_attempt_details(result: dict, lines: int = LOG_TAIL_LINES) -> None:
+    """실패한 attempt 마다 provider·status·error_class·reason + 로그 꼬리를 찍는다.
+
+    결함 C(docs/IMPROVEMENTS_2026-09-23.md §0): 예전 CLI 는
+    `→ ok=False UNKNOWN 미분류 오류 — …` 한 줄만 찍었고, 실제 원인(커널 Traceback)이
+    담긴 `RunResult.log_tail` 은 반환 dict 안에서 잠자고 있었다. 사람이 원인을 보려면
+    `kaggle kernels output` 을 손으로 받아야 했다 — 그건 도구가 할 일이다.
+    """
+    for a in result.get("attempts") or []:
+        if a.get("ok"):
+            continue
+        print(f"\n--- [{a.get('provider')}] status={a.get('status', '?')} "
+              f"error_class={a.get('error_class') or '-'} ---")
+        print(f"  reason: {a.get('reason', '')}")
+        if a.get("artifacts_dir"):
+            print(f"  artifacts: {a['artifacts_dir']}")
+        tail = (a.get("log_tail") or "").rstrip().splitlines()
+        for ln in tail[-lines:]:
+            print(f"  | {ln}")
 
 
 def _cmd_run(args) -> int:
@@ -32,7 +60,55 @@ def _cmd_run(args) -> int:
     result = orchestrator.run(job, once=args.once, max_rounds=args.rounds)
     print("\n===== RESULT =====")
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if not args.quiet:
+        print_attempt_details(result)
+    for a in result.get("attempts") or []:
+        if a.get("ok") and a.get("artifacts_dir"):
+            print(f"\n산출물: {a['artifacts_dir']}")
     return 0 if result["ok"] else 1
+
+
+def _job_for_logs(target: str) -> Job:
+    """`fcc logs <job.yaml|name>` 인자 해석.
+
+    파일이면 그대로 로드하고, 아니면 이름만 받은 것으로 본다(커널 slug 계산에는
+    job.name 하나면 충분하다 — 실행을 다시 하지 않으므로 entrypoint 는 비워둔다).
+    """
+    if os.path.isfile(target):
+        return Job.load(target)
+    return Job(name=target, entrypoint="")
+
+
+def _cmd_logs(args) -> int:
+    """Kaggle 커널의 상태 + 산출물(diag.txt 포함)을 받아 로그 꼬리를 보여준다(결함 C).
+
+    run 이 이미 끝난 뒤에도, 혹은 다른 창에서 도는 중에도 원인을 볼 수 있어야 한다.
+    """
+    from .providers.kaggle import KaggleProvider, _UTF8
+
+    job = _job_for_logs(args.job)
+    prov = KaggleProvider()
+    if not prov._user():
+        print("Kaggle 인증 없음 — `kaggle auth login` 후 다시 시도하세요.")
+        return 1
+    kid = prov.kernel_id(job)
+    print(f"kernel: {kid}")
+    _, st = prov._sh(["kaggle", "kernels", "status", kid], 60, _UTF8)
+    print(f"status: {(st or '').strip()}")
+
+    adir, diag = prov.fetch_outputs(job, kid)
+    print(f"artifacts: {adir}")
+    files = sorted(os.path.relpath(p, adir)
+                   for p in glob.glob(os.path.join(adir, "**", "*"), recursive=True)
+                   if os.path.isfile(p))
+    print(f"files({len(files)}): {', '.join(files[:20]) or '(없음)'}")
+    if diag:
+        print(f"\n--- diag.txt (마지막 {args.lines}줄) ---")
+        for ln in diag.rstrip().splitlines()[-args.lines:]:
+            print(f"  | {ln}")
+    else:
+        print("\n(diag.txt 없음 — 커널이 아직 안 돌았거나 부팅 전에 죽었다.)")
+    return 0
 
 
 def _cmd_providers(args) -> int:
@@ -106,7 +182,15 @@ def main(argv=None) -> int:
     r.add_argument("--dry-run", action="store_true", help="계획만 출력")
     r.add_argument("--no-interactive", action="store_true",
                    help="온디맨드 로그인 프롬프트 끔(CI/무인)")
+    r.add_argument("--quiet", action="store_true",
+                   help="실패 상세(error_class/reason/로그 꼬리) 출력 끔")
     r.set_defaults(fn=_cmd_run)
+
+    lo = sub.add_parser("logs", help="Kaggle 커널 상태 + 산출물/로그 꼬리")
+    lo.add_argument("job", help="job.yaml 경로 또는 job 이름")
+    lo.add_argument("--lines", type=int, default=LOG_TAIL_LINES,
+                    help=f"보여줄 로그 줄 수(기본 {LOG_TAIL_LINES})")
+    lo.set_defaults(fn=_cmd_logs)
 
     sub.add_parser("providers", help="provider probe 상태").set_defaults(fn=_cmd_providers)
     sub.add_parser("status", help="쿨다운 스냅샷").set_defaults(fn=_cmd_status)

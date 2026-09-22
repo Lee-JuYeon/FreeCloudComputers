@@ -41,6 +41,10 @@ class RunResult:
     reason: str = ""
     log_tail: str = ""
     error_class: str = ""
+    # 회수한 산출물 디렉터리(있으면). **맨 뒤에 기본값과 함께** 둔다 — 기존 코드·테스트가
+    # RunResult(False,"error","reason","log","CLASS") 처럼 위치인자로 만들기 때문에
+    # 중간에 끼우면 조용히 어긋난다(불변조건 5, docs/IMPROVEMENTS_2026-09-23.md §2).
+    artifacts_dir: str = ""
 
 
 class Provider(ABC):

@@ -100,10 +100,15 @@ def test_oauth_token_read(tmp_path, monkeypatch):
 
 
 def test_oauth_token_expired_returns_empty(tmp_path, monkeypatch):
+    # 2026-09-23부터 만료 토큰은 refresh_token 으로 자동 갱신을 시도한다(결함 D).
+    # 여기서는 **갱신이 실패하는 경우**의 옛 동작(빈 문자열)을 고정한다.
+    # `_refresh_via_sdk` 를 반드시 몽키패치할 것 — 안 그러면 테스트가 실제 kagglesdk
+    # 네트워크 호출을 한다. 갱신 성공 경로는 tests/test_oauth_refresh.py 가 덮는다.
     import datetime as dt
     from freecloud.providers import kaggle as K
     past = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
     _write_creds(tmp_path, monkeypatch, exp=past)
+    monkeypatch.setattr(K, "_refresh_via_sdk", lambda rt: ("", ""))
     assert K.oauth_access_token() == ""
 
 

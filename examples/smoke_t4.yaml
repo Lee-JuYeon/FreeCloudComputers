@@ -1,10 +1,18 @@
 # T4 선택 스모크 — needs.gpu=T4 이면 freecloud가 P100(kaggle)을 제외하고
 # T4 제공자(kaggle-ui 'T4x2' / colab 'T4')를 고르는지 확인.
+#
+# 2026-09-23부터 이 파일은 결함 A(workdir 업로드)·B(산출물 회수)도 한 번에 검증한다:
+#   workdir → private 데이터셋으로 업로드 → 노드에서 /kaggle/working/workdir 로 풀림
+#   → entrypoint 가 그 안의 hello.txt 를 읽고 /kaggle/working 에 복사
+#   → fcc 가 ./artifacts/smoke-t4/ 로 회수 → success_glob 이 그걸 확인.
+# ※ 반드시 저장소 루트에서 실행할 것(workdir 는 cwd 기준으로 해석된다).
 name: smoke-t4
-entrypoint: "nvidia-smi -L && python -c \"print('t4 ok from freecloud')\""
+entrypoint: "cat hello.txt && cp hello.txt /kaggle/working/hello.txt && nvidia-smi -L"
+workdir: "examples/smoke_workdir"
 checkpoint_repo: ""
 needs:
   gpu: "T4"
   headless: true
 max_runtime_s: 1800
 providers: [kaggle, kaggle-ui]
+success_glob: "artifacts/**/hello.txt"

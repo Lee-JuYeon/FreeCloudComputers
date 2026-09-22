@@ -19,7 +19,11 @@ class Job:
     name: str
     entrypoint: str                       # 원격에서 실행할 명령/스크립트 (예: "python train.py")
     repo: str = ""                        # 코드 소스(git url). 비면 workdir 업로드 방식.
-    workdir: str = "."                    # 로컬 코드 루트(repo 없을 때 업로드 대상)
+    # 로컬 코드 루트. **명시했을 때만** 업로드한다 — "" = 업로드 없음(코드는 entrypoint 가
+    # 알아서 받는다는 뜻). 기본값이 "." 이던 시절에는 "명시 안 함"과 "cwd 를 올려라"를
+    # 구분할 수 없어서, workdir 키가 없는 job 의 커널에까지 '입력 데이터셋 복사' 코드가
+    # 들어가 FileNotFoundError 로 죽었다(2026-09-23 라이브 회귀).
+    workdir: str = ""
     checkpoint_repo: str = ""             # HF Hub repo id — 재개 상태 저장소(예: "user/myjob-ckpt")
     artifacts: list[str] = field(default_factory=list)  # 회수할 원격 경로들
     needs: dict[str, Any] = field(default_factory=dict) # {gpu, min_vram_gb, ...} — provider 필터
@@ -38,7 +42,8 @@ class Job:
         if unknown:
             raise ValueError(f"job.yaml 알 수 없는 키: {sorted(unknown)}")
         job = Job(**d)
-        job.workdir = os.path.abspath(os.path.expanduser(job.workdir))
+        if job.workdir:        # 빈 문자열을 abspath 하면 cwd 가 되어 '명시함'으로 둔갑한다
+            job.workdir = os.path.abspath(os.path.expanduser(job.workdir))
         return job
 
     def resolved_env(self) -> dict[str, str]:

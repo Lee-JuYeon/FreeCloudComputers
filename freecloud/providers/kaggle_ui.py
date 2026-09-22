@@ -58,6 +58,28 @@ def _cookie_says_anon(cookies) -> bool | None:
     return None
 
 
+#: 사용자가 로그인 감지 전에 창을 닫았을 때 보여줄 한 줄(설계 §1.F / 불변조건 9).
+BROWSER_CLOSED_MSG = ("[FAIL] 브라우저가 로그인 감지 전에 닫혔습니다 — "
+                      "다시 실행하고 창을 닫지 마세요(자동으로 닫힙니다)")
+
+
+def _is_browser_closed(exc: BaseException) -> bool:
+    """예외가 '사용자가 브라우저를 닫았다'인가.
+
+    playwright 를 import 해서 isinstance 로 보지 않는다 — playwright 가 없는 환경
+    (그리고 테스트의 가짜 컨텍스트)에서도 같은 판정이 나와야 한다. 클래스 이름과
+    메시지로 본다. TargetClosedError 는 Playwright Error 의 하위 타입이라 이름이
+    MRO 어딘가에 남는다.
+    """
+    names = {c.__name__ for c in type(exc).__mro__}
+    if "TargetClosedError" in names:
+        return True
+    low = str(exc).lower()
+    return ("target page, context or browser has been closed" in low
+            or "browser has been closed" in low
+            or "target closed" in low)
+
+
 def session_is_logged_in(path: str | None = None) -> tuple[bool, str]:
     """저장된 storage_state가 '실제 로그인된' 세션인지 → (ok, detail)."""
     import json
@@ -109,8 +131,11 @@ class KaggleUIProvider(KaggleProvider):
         if not ok:
             return RunResult(False, "needs_setup", f"kaggle-login 선행 필요: {detail}",
                              error_class="AUTH")
-        # 1) 코드 push(커널 등록)
-        work = self._write_kernel_dir(job)
+        # 1) 코드 push(커널 등록) — workdir 업로드·dataset_sources 배선은 부모 헬퍼가
+        #    한다(설계 §3: kaggle-ui 는 재사용만으로 결함 A 가 자동 적용돼야 한다).
+        work, staged_err = self._stage_and_write(job)
+        if staged_err is not None:
+            return staged_err
         rc, log = self._push(work, job)
         if rc != 0:
             from ..errors import classify
@@ -291,18 +316,28 @@ def save_login_state(headful: bool = True, timeout_s: int = 300) -> str:
 
         ok = False
         waited = 0
-        while waited < timeout_s:
-            page.wait_for_timeout(3000)
-            waited += 3
-            try:
-                if _cookie_says_anon(ctx.cookies()) is False:
-                    ok = True
-                    break
-            except Exception:
-                pass  # 페이지 전환 중 일시적 실패는 무시하고 계속 폴링
+        # ⚠️ 사용자가 로그인 감지 전에 창을 닫으면 Playwright 가 TargetClosedError 를
+        #    던진다. 예전엔 그게 트레이스백으로 그대로 터져 "내가 뭘 잘못했나" 싶은
+        #    화면만 남았다(결함 F). 안내 한 줄로 바꿔 rc=1 로 끝낸다.
+        try:
+            while waited < timeout_s:
+                page.wait_for_timeout(3000)
+                waited += 3
+                try:
+                    if _cookie_says_anon(ctx.cookies()) is False:
+                        ok = True
+                        break
+                except Exception as e:
+                    if _is_browser_closed(e):
+                        raise       # 닫힌 건 '일시적 실패'가 아니다 — 폴링해봐야 헛돈다
+                    pass  # 페이지 전환 중 일시적 실패는 무시하고 계속 폴링
 
-        ctx.storage_state(path=_state_path())
-        ctx.close()
+            ctx.storage_state(path=_state_path())
+            ctx.close()
+        except Exception as e:
+            if _is_browser_closed(e):
+                raise SystemExit(BROWSER_CLOSED_MSG)
+            raise
 
     # ⚠️ Windows 콘솔(cp949)은 이모지를 못 찍는다 — 여기서 UnicodeEncodeError로 죽으면
     #    로그인이 성공했는데도 실패처럼 보인다(실측 2026-07-20). CLI 출력은 ASCII로.
