@@ -4,9 +4,13 @@
 Settings→Accelerator→GPU T4 x2→Save를 눌러야 한다. 이 어댑터가 그 클릭을 자동화한다.
 
 흐름:
-  1) KaggleProvider 헬퍼로 코드 push(커널 등록). ※push는 P100 run을 한 번 트리거하지만,
-     job이 체크포인트 재개형이라 무해 — 이어서 T4×2 커밋이 최신 버전으로 덮어씀.
-  2) Playwright: 저장된 로그인 상태로 에디터 열기 → 가속기 'GPU T4 x2' 선택 → Save & Run All.
+  1) KaggleProvider 헬퍼로 코드 push(커널 등록). ※push는 그 자체로 run 을 하나 시작한다 —
+     가속기는 커널에 **저장된 값**(이전 UI 선택이 남아 있으면 T4×2)을 쓴다.
+  2) Playwright: 저장된 로그인 상태로 에디터 열기 → 현재 가속기 읽기.
+     · 이미 'GPU T4 x2' → UI 커밋 생략(push 가 이미 T4×2 로 돌고 있다 — 또 커밋하면 동일
+       세션 2개가 GPU 쿼터를 2배로 쓰고 ckpt/ 를 두고 경합한다, 실측 2026-09-30).
+     · 아니면 'GPU T4 x2' 선택 → Save & Run All(push 가 띄운 이전 가속기 세션은 멈출 API 가
+       없어 그대로 둔다 — 쓸 GPU 가 없으면 스스로 abort).
   3) KaggleProvider 헬퍼로 상태 폴링 + 산출물 회수 + nvidia-smi로 T4×2 실제 확인.
 
 인증(2FA 회피): 최초 1회 `freecloud kaggle-login` 으로 로그인 상태를 저장
@@ -25,6 +29,11 @@ from .base import Probe, RunResult
 from .kaggle import KaggleProvider
 
 from .. import paths
+
+#: 원하는 가속기 옵션 라벨(실측 DOM 의 role=option name).
+T4X2_LABEL = "GPU T4 x2"
+
+_ACCEL_ARIA_RE = re.compile(r"Select Accelerator\.\s*(.*?)\s*currently selected", re.S)
 
 
 def _state_path() -> str:
@@ -146,8 +155,13 @@ class KaggleUIProvider(KaggleProvider):
         if not ok:
             return RunResult(False, "needs_setup", f"UI 자동화 실패: {why}",
                              error_class="UI_AUTOMATION")
+        ui_commit = "skipped" if why.startswith("skipped") else "committed"
+        print(f"[kaggle-ui] ui_commit={ui_commit} ({why})", flush=True)
         # 3) 폴링 + GPU 검증(부모 헬퍼 재사용)
-        return self._poll_and_fetch(job, work)
+        res = self._poll_and_fetch(job, work)
+        # 어느 경로(생략/커밋)로 돌았는지 사람이 결과만 보고 알 수 있게 남긴다.
+        res.reason = f"{res.reason} [ui_commit: {ui_commit}]"
+        return res
 
     # ── Playwright 자동화 ────────────────────────────────────────────────────
     def _set_t4x2_and_commit(self, job: Job) -> tuple[bool, str]:
@@ -167,16 +181,7 @@ class KaggleUIProvider(KaggleProvider):
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 # SPA가 에디터를 렌더할 때까지는 별도로 기다린다.
                 page.wait_for_selector("text=Save Version", timeout=60000)
-
-                # (a) 가속기 설정 열기 — Settings 사이드바의 'Accelerator' 섹션.
-                #     ⚠️ Kaggle DOM 변동 → 여러 방식 fallback. 라이브 검증 시 조정.
-                self._select_accelerator(page, "GPU T4 x2")
-
-                # (b) Save Version → Save & Run All (Commit) → Save
-                self._save_and_run_all(page)
-
-                page.wait_for_timeout(3000)  # 커밋 제출 반영 대기
-                return True, ""
+                return self._commit_on_page(page)
             except PWTimeout as e:
                 return False, f"셀렉터 타임아웃(UI 변경 가능): {e}"
             except Exception as e:
@@ -184,6 +189,58 @@ class KaggleUIProvider(KaggleProvider):
             finally:
                 ctx.close()
                 browser.close()
+
+    def _commit_on_page(self, page, label: str = T4X2_LABEL) -> tuple[bool, str]:
+        """에디터가 렌더된 page 에서 '필요할 때만' 가속기 전환 + Save & Run All.
+
+        `kaggle kernels push` 가 이미 커널의 **저장된 가속기**로 run 을 하나 띄웠다. 저장값이
+        이미 label 이면 여기서 또 커밋하면 동일 세션이 2개가 된다(실측 2026-09-30: 매 체크포인트
+        step 이 HF 에 두 번 push, GPU 쿼터 2배·ckpt/ 경합). 그래서 현재값을 먼저 읽는다.
+        현재값을 못 읽으면(DOM 변경) 예전 동작(선택+커밋)으로 — 읽기 실패로 job 을 죽이지 않는다.
+        선택/커밋 단계의 예외는 그대로 위로 던진다(_set_t4x2_and_commit 이 실패로 변환).
+        """
+        try:
+            current = self._read_accelerator(page)
+            read_err = "" if current is not None else "aria-label 형식 불일치"
+        except Exception as e:  # 콤보박스 못 찾음 등
+            current, read_err = None, f"{type(e).__name__}: {e}"
+
+        if current == label:
+            print("[kaggle-ui] 가속기 이미 T4 x2 — API push 가 이미 실행 중이므로 UI 커밋 생략"
+                  "(중복 세션 방지)", flush=True)
+            return True, "skipped: already T4x2"
+
+        if current is None:
+            print(f"[kaggle-ui] 현재 가속기 읽기 실패({read_err}) — 예전 동작(선택+커밋)으로 진행."
+                  " push 가 띄운 세션과 중복될 수 있다.", flush=True)
+        else:
+            print(f"[kaggle-ui] ⚠️ API push 가 이전 가속기({current})로 세션을 이미 시작했다 — "
+                  "멈출 API 가 없어 그대로 둔다(쓸 GPU 가 없으면 스스로 abort). "
+                  f"{label} 로 전환 후 커밋.", flush=True)
+
+        # (a) 가속기 선택 — 실패는 예외로 표면화.
+        self._select_accelerator(page, label)
+        # (b) Save Version → Save & Run All (Commit) → Save
+        self._save_and_run_all(page)
+        page.wait_for_timeout(3000)  # 커밋 제출 반영 대기
+        prev = current if current is not None else "unknown"
+        return True, f"committed (prev={prev})"
+
+    @staticmethod
+    def _read_accelerator(page) -> str | None:
+        """현재 저장된 가속기 라벨. aria-label 형식이 다르면 None, 콤보박스가 없으면 예외.
+
+        aria-label = "Select Accelerator. <현재값> currently selected." (_select_accelerator 참조)
+        """
+        try:
+            page.get_by_role("button", name="Expand Session options").click(timeout=8000)
+            page.wait_for_timeout(1500)
+        except Exception:
+            pass  # 이미 펼쳐져 있음
+        combo = page.get_by_role("combobox", name=re.compile("Select Accelerator"))
+        aria = combo.first.get_attribute("aria-label", timeout=10000) or ""
+        m = _ACCEL_ARIA_RE.search(aria)
+        return m.group(1).strip() if m and m.group(1).strip() else None
 
     @staticmethod
     def _select_accelerator(page, label: str) -> None:

@@ -168,6 +168,9 @@ freecloud kaggle-login          # 최초 1회: 브라우저 로그인(2FA 포함
 
 동작: 코드 push → Playwright가 로그인 상태로 에디터를 열어 T4×2 선택 + Save & Run All →
 커널 안 `nvidia-smi -L` 로 **실제 T4×2 붙었는지 검증**(불일치면 `needs_setup` 반환).
+**중복 세션 방지:** `kernels push` 자체가 커널에 *저장된* 가속기로 run 을 이미 시작한다. 그래서
+에디터의 현재 가속기가 이미 `GPU T4 x2` 면 UI 커밋을 **생략**한다(또 커밋하면 동일 세션 2개 → GPU
+쿼터 2배·`ckpt/` 경합, 실측 2026-09-30). 결과 reason 끝의 `[ui_commit: skipped|committed]` 로 경로 확인.
 셀렉터는 Kaggle 에디터 DOM 기준 best-effort — UI 바뀌면 `providers/kaggle_ui.py` 조정.
 디버그: `FREECLOUD_KAGGLE_HEADFUL=1` 로 브라우저 띄워 확인.
 
