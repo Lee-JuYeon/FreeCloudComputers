@@ -65,6 +65,11 @@ def _cmd_run(args) -> int:
     for a in result.get("attempts") or []:
         if a.get("ok") and a.get("artifacts_dir"):
             print(f"\n산출물: {a['artifacts_dir']}")
+    if result.get("detached"):
+        # 실패가 아니라 '분리' — 원격 커널은 계속 돌며 checkpoint_repo 로 push 중.
+        # 종료코드는 0/1 두 값뿐이라 1 을 유지하되(완료 아님), 마지막 줄로 분명히 알린다.
+        print(f"\n⏳ [detached] 커널 계속 실행 중 — 산출물은 checkpoint_repo"
+              f"({job.checkpoint_repo}) 에서 회수. 상태: `fcc logs {args.job}`", flush=True)
     return 0 if result["ok"] else 1
 
 

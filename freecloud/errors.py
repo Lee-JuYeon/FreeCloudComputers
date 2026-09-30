@@ -7,6 +7,8 @@
   RETRY     — 같은 provider로 재시도(일시적 네트워크 등).
   FAILOVER  — 이 provider는 지금 못 씀 → 쿨다운 걸고 다음 provider로.
   ABORT     — job 자체 결함(코드/설정 오류) → 페일오버해도 어디서도 실패. 사람 개입 필요.
+  DETACH    — 폴링 상한은 넘었지만 원격 커널은 **아직 살아서** checkpoint_repo 로 push 중.
+              실패가 아니다 → 쿨다운 없음, 재시도 없음, 다른 provider 시도 없음(이중 학습 방지).
 """
 from __future__ import annotations
 
@@ -16,18 +18,28 @@ from dataclasses import dataclass
 RETRY = "RETRY"
 FAILOVER = "FAILOVER"
 ABORT = "ABORT"
+DETACH = "DETACH"
 
 
 @dataclass
 class Diagnosis:
     error_class: str
-    action: str          # RETRY | FAILOVER | ABORT
+    action: str          # RETRY | FAILOVER | ABORT | DETACH
     advice: str          # 사람이 읽을 조치
     cooldown_s: int = 0  # FAILOVER 시 이 provider를 얼마나 쉬게 할지(0=기본값 사용)
 
 
 # (정규식, error_class, action, advice, cooldown_초). 위에서부터 첫 매치.
 _PLAYBOOK: list[tuple[str, str, str, str, int]] = [
+    # ── 분리(detached): 맨 위에 둔다 ─────────────────────────────────────────
+    # 2026-09-30 실측: 커널은 4시간짜리인데 폴링 상한 5400s 에서 TIMEOUT 으로 끊고,
+    # 그 문자열의 "timeout" 이 아래 TRANSIENT(RETRY)에 걸려 **같은 커널을 다시 push** 하고
+    # 30분 쿨다운까지 걸었다. 커널은 멀쩡히 checkpoint 를 올리는 중이었다. 살아 있는 런은
+    # 실패가 아니다 — 쿨다운 0, 재시도·페일오버 없이 그대로 둔다.
+    (r"\bdetached\b",
+     "DETACHED", DETACH, "폴링 상한 초과 — 원격 커널은 계속 실행 중. 산출물은 "
+     "checkpoint_repo 에서 회수. 다른 provider 를 띄우면 이중 학습이 된다.", 0),
+
     # ── 쿼터/가용성: 다른 provider로 페일오버 ────────────────────────────────
     (r"too\s*many\s*assignments|service unavailable|503|no backend|"
      r"cannot connect to gpu|usage limit|quota (?:exceeded|exhausted)|"

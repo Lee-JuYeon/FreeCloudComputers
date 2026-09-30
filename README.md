@@ -85,12 +85,31 @@ providers: [lightning, kaggle, colab, modal]
 실패하면 CLI 가 provider·status·`error_class`·reason 과 **로그 꼬리 40줄**을 찍습니다
 (`fcc run --quiet` 로 끄기). 나중에 다시 보려면 `fcc logs <job.yaml|이름>`.
 
+## 라운드·쿨다운·폴링 상한(`max_runtime_s`)
+
+- **UNFIT 은 라운드 전에 한 번만 거릅니다.** `needs`(gpu·VRAM·headless)를 못 맞추는
+  provider 는 `[orch] 건너뜀: kaggle: GPU 'P100' — 'T4' 요구 불충족` 한 줄로 알리고 라운드에서
+  뺍니다. 적합한 provider 가 하나도 없으면 라운드 없이 즉시 종료합니다.
+- **적합 provider 가 전부 쿨다운이면 라운드를 태우지 않고 기다립니다** — 가장 짧은
+  쿨다운만큼(1회 최대 30분, `orchestrator.COOLDOWN_WAIT_CAP_S`) 잔 뒤 다시 봅니다.
+- **폴링 상한 초과(Kaggle/kaggle-ui):** `max_runtime_s` 가 지났는데 커널이 아직 `running`이면
+  - `checkpoint_repo` 가 있으면 → **`detached`**(error_class `DETACHED`). 실패가 아닙니다 —
+    커널은 계속 돌며 checkpoint 를 push 중입니다. 쿨다운을 걸지 않고, 재시도도, 다른 provider
+    도 시도하지 않고(이중 학습 방지) 즉시 끝냅니다. 마지막 줄 `⏳ [detached] 커널 계속 실행 중 …`.
+    결과는 `checkpoint_repo` 에서 받습니다. (종료코드는 완료가 아니므로 1.)
+  - 없으면 → 예전처럼 `TIMEOUT`. 받을 곳이 없는 런이라 커널 중지를 시도하지만, kaggle CLI
+    2.2.x 에는 중지 명령이 없어 로그로만 알립니다 — Kaggle 웹에서 수동 Stop 하세요.
+- **heartbeat:** 폴링 중 10분(`providers.kaggle.HEARTBEAT_S`)마다
+  `[kaggle-ui] ♥ 30분 경과 · kernel=… · status=running · ckpt=checkpoint step=200` 한 줄을
+  찍습니다(`ckpt=` 는 `checkpoint_repo` 의 최신 HF 커밋 제목, 조회 실패는 무시).
+
 ## 아키텍처
 
 ```
 job.yaml ─► orchestrator ─► [provider 순회: probe→run→성공?]
                │                    │
                │                    └─ 실패 분류(errors) → RETRY / FAILOVER(쿨다운) / ABORT
+               │                                            / DETACH(커널 생존 → 그대로 종료)
                │
                └─ 상태는 provider에 없음 ─► checkpoint(HF Hub) ◄─ 모든 노드가 pull/push
 ```

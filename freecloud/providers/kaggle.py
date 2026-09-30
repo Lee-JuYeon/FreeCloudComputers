@@ -42,6 +42,13 @@ _SKIP_GLOBS = ("*.pyc",)
 #: 원격 노드에서 workdir 이 풀리는 곳. 커널이 env 로도 주입한다(FREECLOUD_WORKDIR).
 REMOTE_WORKDIR = "/kaggle/working/workdir"
 
+#: 폴링 중 생존 신호(heartbeat) 간격(초). 2026-09-30 실측: 3시간 폴링 동안 한 줄도 안
+#: 찍혀서(stdout → 로그 파일) 살아 있는지 죽었는지 알 수 없었다. 테스트는 이 값을 패치한다.
+HEARTBEAT_S = 600
+
+#: 이 문자열이 status 에 있으면 커널이 아직 살아 있다(완료/오류 전).
+_ALIVE_MARKERS = ("running", "queued")
+
 
 class _WorkdirError(Exception):
     """workdir 스테이징 실패 — run() 이 RunResult 로 바꿔 돌려준다.
@@ -371,13 +378,48 @@ class KaggleProvider(Provider):
         g = (got or "").lower().replace(" ", "").replace("-", "")
         return not w or not g or w in g or g in w
 
+    @staticmethod
+    def _status_word(st: str) -> str:
+        """`kaggle kernels status` 출력 → 짧은 상태어. 예: 'KernelWorkerStatus.RUNNING' → 'running'."""
+        m = re.search(r'status\s+"?([A-Za-z_.]+)"?', st or "")
+        word = m.group(1) if m else (st or "").strip()[-60:]
+        return word.rsplit(".", 1)[-1].lower() or "?"
+
+    def _heartbeat(self, job: Job, kid: str, elapsed: float, st: str) -> None:
+        """폴링 생존 신호 한 줄. checkpoint_repo 가 있으면 최신 커밋 제목도 붙인다."""
+        line = (f"[{self.name}] ♥ {int(elapsed) // 60}분 경과 · kernel={kid} "
+                f"· status={self._status_word(st)}")
+        if job.checkpoint_repo:
+            title = latest_checkpoint_title(job.checkpoint_repo)
+            line += f" · ckpt={title or '(조회 실패/없음)'}"
+        print(line, flush=True)
+
+    def stop_kernel(self, kid: str) -> tuple[bool, str]:
+        """실행 중 커널 중지 시도 → (중지됨?, 사유).
+
+        TODO: kaggle CLI 2.2.x 의 `kernels` 하위명령에는 stop/cancel 이 **없다**
+        (list/files/get/init/push/pull/output/status/logs/update/delete/topics).
+        kagglesdk 에는 `KernelsApiService.cancel_kernel_session(kernel_session_id)` 가
+        있지만 필요한 정수 `kernel_session_id` 를 CLI(status) 가 주지 않는다 — 그 id 를
+        얻는 공식 경로가 확인되면 여기서 호출한다. 그때까지는 '못 멈췄다'를 **말만** 한다.
+        """
+        return False, (f"kaggle CLI 에 커널 중지 API 없음 — kernel={kid} 는 원격에서 계속 돌 수 "
+                       f"있다(Kaggle 웹에서 수동 Stop 필요).")
+
     def _poll_and_fetch(self, job: Job, work: str) -> RunResult:
         kid = self.kernel_id(job)
-        deadline = time.time() + job.max_runtime_s
+        start = time.time()
+        deadline = start + job.max_runtime_s
+        last_hb = start
+        st = ""
         while time.time() < deadline:
             time.sleep(60)
             rc, st = self._sh(["kaggle", "kernels", "status", kid], 60, _UTF8)
             low = st.lower()
+            now = time.time()
+            if now - last_hb >= HEARTBEAT_S:
+                self._heartbeat(job, kid, now - start, st)
+                last_hb = now
             if "complete" in low:
                 adir, diag = self.fetch_outputs(job, kid)
                 got = self.assigned_gpu(diag)
@@ -405,6 +447,23 @@ class KaggleProvider(Provider):
                 d = classify(st + "\n" + diag)
                 return RunResult(False, "error", d.advice, (diag or st)[-1200:],
                                  d.error_class, adir)
+        # ── 폴링 상한 도달 ───────────────────────────────────────────────────
+        # 2026-09-30 실측: 커널은 ~4시간짜리였는데 5400s 에서 TIMEOUT 으로 끊고 다른
+        # provider 로 넘어갔다 — 원격 커널은 checkpoint 를 계속 push 하는 **고아**가 됐다.
+        alive = any(m in (st or "").lower() for m in _ALIVE_MARKERS)
+        if alive and job.checkpoint_repo:
+            # 살아 있고 결과를 받을 곳(checkpoint_repo)도 있다 → 실패가 아니라 '분리'.
+            # 오케스트레이터는 쿨다운·재시도·다른 provider 없이 멈춘다(이중 학습 방지).
+            return RunResult(False, "detached",
+                             f"폴링 상한 {job.max_runtime_s}s 초과 — 커널은 계속 실행 중"
+                             f"(kernel={kid}). 산출물은 checkpoint_repo({job.checkpoint_repo})"
+                             f" 에서 회수.",
+                             (st or "")[-400:], "DETACHED")
+        if alive:
+            # 받을 곳이 없는 런을 계속 돌리면 쿼터만 태운다 → 멈춰 본다.
+            stopped, why = self.stop_kernel(kid)
+            print(f"[{self.name}] 폴링 상한 초과 — 커널 중지 "
+                  f"{'완료' if stopped else '실패'}: {why}", flush=True)
         return RunResult(False, "timeout", f"Kaggle 폴링 {job.max_runtime_s}s 초과.",
                          error_class="TIMEOUT")
 
@@ -438,6 +497,24 @@ class KaggleProvider(Provider):
 
 
 # ── D. OAuth access token (3시간 수명 → refresh_token 으로 자동 갱신) ────────
+def latest_checkpoint_title(repo: str) -> str:
+    """HF checkpoint_repo 의 최신 커밋 제목(예: 'checkpoint step=200'). 실패하면 ''.
+
+    heartbeat 용 부가정보일 뿐이라 **어떤 예외도 밖으로 내보내지 않는다** — HF 가
+    잠깐 흔들린다고 몇 시간짜리 폴링이 죽으면 안 된다. 테스트는 이 함수를 몽키패치한다.
+    """
+    try:
+        from huggingface_hub import HfApi
+        tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+        if not tok:
+            from .. import secrets
+            tok = secrets.get("HF_TOKEN") or secrets.get("HUGGINGFACE_TOKEN")
+        commits = HfApi(token=tok or None).list_repo_commits(repo)
+        return str(commits[0].title) if commits else ""
+    except Exception:
+        return ""
+
+
 def _credentials_path() -> str:
     return os.path.expanduser("~/.kaggle/credentials.json")
 
