@@ -177,6 +177,26 @@ freecloud kaggle-login          # 최초 1회: 브라우저 로그인(2FA 포함
 > UI에서 T4×2가 회색이면(수동 점검): ①전화번호 인증 ②주간 쿼터 소진 ③남의 노트북
 > Viewer(→Copy&Edit) ④세션 running 중(→Stop).
 
+### Lightning AI — provider `lightning` (lightning-sdk Job)
+
+```bash
+pip install lightning-sdk
+export LIGHTNING_USER_ID=...  LIGHTNING_API_KEY=...          # lightning.ai → Settings
+export LIGHTNING_TEAMSPACE=owner/teamspace                     # 슬러그(예: lee-juyeon/default-project)
+# 선택
+export FREECLOUD_LIGHTNING_MACHINE=T4        # lightning_sdk.Machine 속성명(T4, T4_X_2, L4 …)
+export FREECLOUD_LIGHTNING_IMAGE=pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel   # 기본값
+export FREECLOUD_LIGHTNING_ATTEMPTS=5        # 선점 시 Lightning 이 스스로 재실행하는 횟수
+export LIGHTNING_STUDIO=my-studio            # 주면 이미지 대신 기존 스튜디오 스냅샷으로 실행
+```
+
+기본은 **docker 이미지 Job**(스튜디오를 켜지 않는다 — Job 은 이미지/스냅샷으로 돌아서 스튜디오
+start 는 크레딧만 태운다). `LIGHTNING_STUDIO` 를 주면 그 **기존** 스튜디오(만들지도 켜지도 않음)의
+스냅샷으로 돈다. 항상 interruptible(무료 티어), Job 이름은 `fc-<name>-<epoch>` 로 매번 유일.
+env 는 `env=` 와 command 앞 `export` 양쪽으로 주입. 폴링 상한(`max_runtime_s`)에 닿아도 Job 을
+멈추지 않고 `detached` 로 돌려준다(Kaggle 과 같은 계약, 10분마다 `♥` heartbeat).
+크레딧/쿼터 부족은 `QUOTA_COOLDOWN` → 다음 provider 로 페일오버.
+
 ## 새 provider 추가
 
 `providers/base.py`의 `Provider`를 상속해 `probe()`/`run()` 구현 → `registry.py`에 한 줄 등록.
