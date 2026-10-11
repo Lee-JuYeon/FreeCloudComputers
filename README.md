@@ -187,12 +187,16 @@ export LIGHTNING_TEAMSPACE=owner/teamspace                     # 슬러그(예: 
 export FREECLOUD_LIGHTNING_MACHINE=T4        # lightning_sdk.Machine 속성명(T4, T4_X_2, L4 …)
 export FREECLOUD_LIGHTNING_IMAGE=pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel   # 기본값
 export FREECLOUD_LIGHTNING_ATTEMPTS=5        # 선점 시 Lightning 이 스스로 재실행하는 횟수
+export FREECLOUD_LIGHTNING_INTERRUPTIBLE=1   # 기본 1=spot; 0/false/no → on-demand(선점 없음, 크레딧 더 듦)
 export LIGHTNING_STUDIO=my-studio            # 주면 이미지 대신 기존 스튜디오 스냅샷으로 실행
 ```
 
 기본은 **docker 이미지 Job**(스튜디오를 켜지 않는다 — Job 은 이미지/스냅샷으로 돌아서 스튜디오
 start 는 크레딧만 태운다). `LIGHTNING_STUDIO` 를 주면 그 **기존** 스튜디오(만들지도 켜지도 않음)의
-스냅샷으로 돈다. 항상 interruptible(무료 티어), Job 이름은 `fc-<name>-<epoch>` 로 매번 유일.
+스냅샷으로 돈다. 기본은 interruptible(spot)이지만 무료 티어 spot 은 선점이 잦다(실측: T4 가 20분~3시간
+안에 두 번 `Job stopped`, `max_run_attempts=5` 여도 자동 재시도 없음) — 짧은 잔여 작업은
+`FREECLOUD_LIGHTNING_INTERRUPTIBLE=0`(on-demand)이 낫다, 대신 크레딧이 더 든다. 실행 시
+`[lightning] machine=… interruptible=… attempts=… image=…` 한 줄을 찍는다. Job 이름은 `fc-<name>-<epoch>` 로 매번 유일.
 env 는 `env=` 와 command 앞 `export` 양쪽으로 주입. 폴링 상한(`max_runtime_s`)에 닿아도 Job 을
 멈추지 않고 `detached` 로 돌려준다(Kaggle 과 같은 계약, 10분마다 `♥` heartbeat).
 크레딧/쿼터 부족은 `QUOTA_COOLDOWN` → 다음 provider 로 페일오버.

@@ -18,8 +18,11 @@ teamspace: env LIGHTNING_TEAMSPACE = "owner/teamspace" 슬러그(예: "lee-juyeo
      을 문자열 그대로 비교해 불일치로 터진다. 스튜디오가 teamspace 를 이미 안다.)
 
 머신: FREECLOUD_LIGHTNING_MACHINE(기본 T4; `Machine` 속성명, 예 T4_X_2·L4).
-interruptible=True(무료 티어). 선점되면 Lightning 이 max_run_attempts
-(FREECLOUD_LIGHTNING_ATTEMPTS, 기본 5)까지 스스로 재실행 — 워크로드는 자기 체크포인트로 재개.
+interruptible: FREECLOUD_LIGHTNING_INTERRUPTIBLE(기본 "1"=spot; "0"/"false"/"no" → on-demand).
+선점되면 Lightning 이 max_run_attempts(FREECLOUD_LIGHTNING_ATTEMPTS, 기본 5)까지 재실행한다고
+문서에 있으나, 실측(2026-10-11) 무료 티어 T4 spot 이 20분~3시간 안에 두 번 선점("Job stopped",
+status Stopped)됐고 attempts=5 여도 자동 재시도는 관찰되지 않았다. 그래서 짧은 잔여 작업은
+on-demand(=0) 가 낫다 — 대신 크레딧이 더 든다. 워크로드는 자기 체크포인트로 재개.
 Job 이름은 teamspace 안에서 유일해야 하므로 `fc-<job>-<epoch>` 로 매번 새로 짓는다.
 
 env 주입: `env=job.resolved_env()` + command 앞 export 접두사(이중 안전장치 — 일부 SDK 버전은
@@ -113,12 +116,15 @@ class LightningProvider(Provider):
             return RunResult(False, "error", "FREECLOUD_LIGHTNING_ATTEMPTS 는 정수여야 한다.",
                              error_class="JOB_CONFIG")
 
+        interruptible = os.environ.get("FREECLOUD_LIGHTNING_INTERRUPTIBLE", "1").strip().lower() \
+            not in ("0", "false", "no")
+
         env = job.resolved_env()
         cmd = self.export_prefix(env) + job.entrypoint
         self.warn_unfetched(job, self.name)
 
         kw = dict(name=f"fc-{job.name}-{int(time.time())}"[:40], machine=machine,
-                  command=cmd, teamspace=ts, env=env, interruptible=True,
+                  command=cmd, teamspace=ts, env=env, interruptible=interruptible,
                   max_run_attempts=attempts)
         try:
             studio_name = (os.environ.get("LIGHTNING_STUDIO") or "").strip()
@@ -134,6 +140,9 @@ class LightningProvider(Provider):
                 kw.pop("teamspace")
             else:
                 kw["image"] = os.environ.get("FREECLOUD_LIGHTNING_IMAGE", DEFAULT_IMAGE)
+            src = f"image={kw['image']}" if "image" in kw else f"studio={studio_name}"
+            print(f"[{self.name}] machine={mname} interruptible={interruptible} "
+                  f"attempts={attempts} {src}", flush=True)
             lj = LJob.run(**kw)
         except Exception as e:
             msg = str(e)

@@ -80,7 +80,7 @@ def _fake_sdk(monkeypatch, statuses=(FakeStatus.Completed,), logs="", run_exc=No
     monkeypatch.setattr(L.time, "time", lambda: clock["t"])
     monkeypatch.setattr(L.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
     for k in ("LIGHTNING_STUDIO", "FREECLOUD_LIGHTNING_MACHINE", "FREECLOUD_LIGHTNING_IMAGE",
-              "FREECLOUD_LIGHTNING_ATTEMPTS"):
+              "FREECLOUD_LIGHTNING_ATTEMPTS", "FREECLOUD_LIGHTNING_INTERRUPTIBLE"):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("LIGHTNING_TEAMSPACE", "lee-juyeon/default-project")
     monkeypatch.setenv("LIGHTNING_USER_ID", "0" * 36)
@@ -119,6 +119,18 @@ def test_image_and_machine_overrides(monkeypatch):
     LightningProvider().run(_job())
     kw = rec["run"][0]
     assert (kw["image"], kw["machine"], kw["max_run_attempts"]) == ("my/img:1", "MACHINE_L4", 2)
+
+
+def test_interruptible_env_toggle(monkeypatch, capsys):
+    rec, _ = _fake_sdk(monkeypatch)
+    LightningProvider().run(_job())
+    assert rec["run"][0]["interruptible"] is True                 # 기본 = spot
+    assert "interruptible=True attempts=5 image=" in capsys.readouterr().out
+    for v in ("0", "false", "NO"):
+        monkeypatch.setenv("FREECLOUD_LIGHTNING_INTERRUPTIBLE", v)
+        LightningProvider().run(_job())
+        assert rec["run"][-1]["interruptible"] is False           # on-demand
+    assert "[lightning] machine=T4 interruptible=False attempts=5" in capsys.readouterr().out
 
 
 def test_studio_path_never_starts(monkeypatch):
