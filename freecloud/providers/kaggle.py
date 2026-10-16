@@ -49,6 +49,13 @@ HEARTBEAT_S = 600
 #: 이 문자열이 status 에 있으면 커널이 아직 살아 있다(완료/오류 전).
 _ALIVE_MARKERS = ("running", "queued")
 
+#: stale-kernel 가드(2026-10-16 수리). push 가 rc=0 이어도 새 세션을 못 띄우면
+#: (쿼터 소진 시 재발, 10-08·10-16) 폴링이 옛 COMPLETE 를 성공으로 읽는다.
+#: push 전후로 lastRunTime/status 변화를 최대 이 시간(초)만큼 폴링해 확인한다.
+#: 테스트는 두 값을 0 으로 패치해 즉시 판정한다.
+STALE_KERNEL_POLL_S = 180
+STALE_KERNEL_POLL_INTERVAL_S = 15
+
 
 class _WorkdirError(Exception):
     """workdir 스테이징 실패 — run() 이 RunResult 로 바꿔 돌려준다.
@@ -308,9 +315,62 @@ class KaggleProvider(Provider):
             print(f"[{self.name}] {note}", flush=True)
         return self._write_kernel_dir(job, ref or ""), None
 
+    def _kernel_run_signature(self, kid: str) -> tuple[str, str]:
+        """(lastRunTime, status_word) — push 전후 비교용 지문. 조회 실패 시 그 자리만 ''.
+
+        lastRunTime 은 `kaggle kernels list -m -v`(CSV)에서, status 는 `kernels status`에서
+        읽는다. 둘 다 KaggleProvider._sh(토큰 주입)를 쓴다.
+        """
+        rc, out = self._sh(["kaggle", "kernels", "list", "-m", "-v"], 60, _UTF8)
+        last = _parse_last_run_time(out, kid) if rc == 0 else ""
+        _, st = self._sh(["kaggle", "kernels", "status", kid], 60, _UTF8)
+        return last, self._status_word(st or "")
+
+    def _wait_kernel_started(self, kid: str, before: tuple[str, str]) -> tuple[bool, str]:
+        """push 가 실제로 새 세션을 띄웠는지 최대 STALE_KERNEL_POLL_S 폴링 → (stale?, 사유).
+
+        정상 기동 신호(= stale 아님):
+          · lastRunTime 이 push 전과 달라졌다(새 run 기록), 또는
+          · status 가 complete 가 아니게 전환됐다(running/queued 등).
+        상한까지 lastRunTime 그대로 + status 가 여전히 complete 면 STALE_KERNEL.
+        push 전 지문을 아예 못 읽었으면(둘 다 '') 비교 기준이 없다 → 통과(거짓양성 금지,
+        기존 동작 유지 — 처음 돌리는 커널 등).
+        """
+        before_lrt, before_st = before
+        if not before_lrt and not before_st:
+            return False, ""
+        deadline = time.time() + STALE_KERNEL_POLL_S
+        now_lrt, now_st = before_lrt, before_st
+        while True:
+            time.sleep(STALE_KERNEL_POLL_INTERVAL_S)
+            now_lrt, now_st = self._kernel_run_signature(kid)
+            if now_lrt and now_lrt != before_lrt:
+                return False, ""                       # 새 run 기록됨
+            if now_st and now_st not in ("complete", "?", ""):
+                return False, ""                       # running/queued 등으로 전환됨
+            if time.time() >= deadline:
+                break
+        status_now = now_st or before_st
+        if now_lrt == before_lrt and status_now == "complete":
+            return True, (f"STALE_KERNEL: push(rc=0) 후 {STALE_KERNEL_POLL_S}s 동안 "
+                          f"lastRunTime 변화 없음({before_lrt!r}) + status={status_now!r} — "
+                          f"push 가 새 세션을 못 띄웠다(쿼터 소진 추정). 다음 provider 로 페일오버.")
+        return False, ""
+
     def _push(self, work: str, job: Job) -> tuple[int, str]:
         env = {**_UTF8, **job.resolved_env()}
-        return self._sh(["kaggle", "kernels", "push", "-p", work], 300, env)
+        kid = self.kernel_id(job)
+        # push 전 지문을 찍어두고(쿼터 소진이면 push 가 rc=0 이어도 새 세션을 안 띄움),
+        # push 후 변화가 없으면 STALE_KERNEL 로 실패시켜 옛 COMPLETE 를 성공으로 읽는 걸 막는다.
+        before = self._kernel_run_signature(kid)
+        rc, log = self._sh(["kaggle", "kernels", "push", "-p", work], 300, env)
+        if rc != 0:
+            return rc, log
+        stale, why = self._wait_kernel_started(kid, before)
+        if stale:
+            print(f"[{self.name}] {why}", flush=True)
+            return 1, log + "\n" + why
+        return rc, log
 
     # ── B. 산출물 회수 ──────────────────────────────────────────────────────
     def fetch_outputs(self, job: Job, kernel_id: str) -> tuple[str, str]:
@@ -494,6 +554,38 @@ class KaggleProvider(Provider):
             return RunResult(False, "error", d.advice, log[-1200:], d.error_class)
         return self._poll_and_fetch(job, work)
 
+
+
+# ── stale-kernel 가드: `kaggle kernels list -m -v`(CSV) 파싱 ──────────────────
+def _parse_last_run_time(csv_text: str, kid: str) -> str:
+    """`kaggle kernels list -m -v` CSV 에서 해당 커널의 lastRunTime 문자열. 없으면 ''.
+
+    kid 는 'user/slug' 꼴. CSV 의 ref 열이 kid 또는 그 slug 와 일치하는 행을 찾는다.
+    lastRunTime 열이 없으면(컬럼명 변동) 행 전체를 지문으로 돌려준다 — 변화 감지에는
+    그걸로 충분하다(변하기만 하면 '새 run'). 파싱 실패는 '' (판정 불가 → 가드 통과).
+    """
+    import csv as _csv
+    import io
+    slug = kid.split("/")[-1].strip().lower()
+    try:
+        rows = list(_csv.reader(io.StringIO(csv_text or "")))
+    except Exception:
+        return ""
+    if not rows:
+        return ""
+    header = [h.strip().lower() for h in rows[0]]
+    ref_i = header.index("ref") if "ref" in header else 0
+    lrt_i = next((i for i, h in enumerate(header)
+                  if h.replace(" ", "") == "lastruntime"), None)
+    for row in rows[1:]:
+        if len(row) <= ref_i:
+            continue
+        ref = row[ref_i].strip().lower()
+        if ref == kid.strip().lower() or ref.split("/")[-1] == slug:
+            if lrt_i is not None and len(row) > lrt_i:
+                return row[lrt_i].strip()
+            return "|".join(c.strip() for c in row)      # 지문 대용(행 전체)
+    return ""
 
 
 # ── D. OAuth access token (3시간 수명 → refresh_token 으로 자동 갱신) ────────

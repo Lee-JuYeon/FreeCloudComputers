@@ -43,8 +43,19 @@ _PLAYBOOK: list[tuple[str, str, str, str, int]] = [
     # ── 쿼터/가용성: 다른 provider로 페일오버 ────────────────────────────────
     (r"too\s*many\s*assignments|service unavailable|503|no backend|"
      r"cannot connect to gpu|usage limit|quota (?:exceeded|exhausted)|"
-     r"you have exhausted|weekly gpu|out of .*credits",
+     r"you have exhausted|weekly gpu|out of .*credits|"
+     # kaggle-ui 쿼터 감지(에디터 페이지 텍스트 + error_class 토큰, 2026-10-16 수리):
+     # 'almost out of quota' 경고나 Quota ≥30h 를 읽어 QUOTA_COOLDOWN 으로 실패시킨다.
+     r"quota_cooldown|almost out of quota",
      "QUOTA_COOLDOWN", FAILOVER, "이 provider의 무료 GPU 쿼터/쿨다운. 다음 provider로 넘어감.", 3600),
+
+    # ── stale-kernel: push 가 rc=0 이어도 새 세션을 못 띄움 → 페일오버 ──────────
+    # 2026-10-08·10-16 실측: 쿼터 소진 상태에서 `kaggle kernels push` 가 rc=0 이지만
+    # 새 버전/세션을 안 띄운다. 폴링이 옛 COMPLETE 를 읽어 거짓 성공으로 보고했다.
+    # kaggle._push 가 push 전후 lastRunTime 변화를 확인해 못 띄웠으면 이 클래스로 실패시킨다.
+    (r"stale_kernel",
+     "STALE_KERNEL", FAILOVER, "push(rc=0) 가 새 세션을 못 띄움(쿼터 소진 추정). "
+     "옛 COMPLETE 를 성공으로 읽지 않고 다음 provider로 페일오버.", 3600),
 
     (r"connection was lost|websocket|session (?:expired|died|disconnected)|"
      r"runtime disconnected|kernel (?:died|restart)",
