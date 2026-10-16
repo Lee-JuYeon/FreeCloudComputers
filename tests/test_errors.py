@@ -139,3 +139,22 @@ def test_no_slot_cases_still_classify_as_no_slot(log):
 def test_oom_needs_word_boundary(log):
     """'boom'·'zoom'·'loom' 안의 oom 을 OOM 으로 잡으면 안 된다(맨몸 `oom` 회귀)."""
     assert classify(log).error_class != "OOM"
+
+
+# ── kaggle-ui 쿼터 / stale-kernel (2026-10-16 수리) ──────────────────────────
+def test_quota_cooldown_token_failover():
+    """kaggle-ui 가 반환하는 error_class 토큰 자체가 QUOTA_COOLDOWN→FAILOVER 로 걸려야."""
+    d = classify("QUOTA_COOLDOWN: GPU 쿼터 소진(31.63h ≥ 30h)")
+    assert d.error_class == "QUOTA_COOLDOWN"
+    assert d.action == FAILOVER and d.cooldown_s > 0
+
+
+def test_almost_out_of_quota_failover():
+    d = classify("You're almost out of quota")
+    assert d.error_class == "QUOTA_COOLDOWN" and d.action == FAILOVER
+
+
+def test_stale_kernel_failover():
+    d = classify("STALE_KERNEL: push(rc=0) 가 새 세션을 못 띄움(쿼터 소진 추정)")
+    assert d.error_class == "STALE_KERNEL"
+    assert d.action == FAILOVER and d.cooldown_s > 0

@@ -35,6 +35,15 @@ T4X2_LABEL = "GPU T4 x2"
 
 _ACCEL_ARIA_RE = re.compile(r"Select Accelerator\.\s*(.*?)\s*currently selected", re.S)
 
+#: 쿼터 소진 감지(2026-10-16 수리). 에디터 페이지 텍스트에서 읽는다.
+#: 실측: 쿼터 소진 상태의 에디터에 'Quota: 31:38 / 30 hrs' + "You're almost out of quota".
+#: 이때 push 는 rc=0 이어도 새 세션을 못 띄우고, '이미 T4x2 → UI 커밋 생략' 경로가
+#: 옛 COMPLETE 를 성공으로 읽어 거짓 성공을 보고했다(10-08·10-16 두 번 재발).
+_QUOTA_RE = re.compile(r"Quota:\s*(\d+):(\d+)\s*/\s*30\s*hrs", re.I)
+_QUOTA_WARN = "almost out of quota"
+#: 주간 GPU 쿼터 상한(시간). 이 이상 썼으면 소진으로 본다.
+QUOTA_LIMIT_H = 30.0
+
 
 def _state_path() -> str:
     """로그인 세션 파일 — 사용자 전역(paths.py). 실행 디렉토리와 무관하게 같은 로그인을 쓴다."""
@@ -153,6 +162,11 @@ class KaggleUIProvider(KaggleProvider):
         # 2) UI로 T4×2 설정 + 커밋
         ok, why = self._set_t4x2_and_commit(job)
         if not ok:
+            # 쿼터 소진은 UI 자동화 실패가 아니라 provider 쿼터 문제 →
+            # QUOTA_COOLDOWN(status="quota")로 다음 provider 로 페일오버시킨다.
+            if why.startswith("QUOTA_COOLDOWN"):
+                return RunResult(False, "quota", f"GPU 쿼터 소진: {why}",
+                                 error_class="QUOTA_COOLDOWN")
             return RunResult(False, "needs_setup", f"UI 자동화 실패: {why}",
                              error_class="UI_AUTOMATION")
         ui_commit = "skipped" if why.startswith("skipped") else "committed"
@@ -199,6 +213,15 @@ class KaggleUIProvider(KaggleProvider):
         현재값을 못 읽으면(DOM 변경) 예전 동작(선택+커밋)으로 — 읽기 실패로 job 을 죽이지 않는다.
         선택/커밋 단계의 예외는 그대로 위로 던진다(_set_t4x2_and_commit 이 실패로 변환).
         """
+        # ⚠️ 쿼터 소진 감지 먼저. 쿼터가 0 이면 push(rc=0) 가 새 세션을 못 띄우고,
+        #    아래 'already T4x2 → skip' 경로가 옛 COMPLETE 를 성공으로 읽는다(거짓 성공).
+        #    소진이면 커밋/진행하지 말고 QUOTA_COOLDOWN 으로 실패시켜 다음 provider 로 넘긴다.
+        exhausted, qdetail = self._quota_exhausted(self._page_text(page))
+        if exhausted:
+            print(f"[kaggle-ui] GPU 쿼터 소진 감지 — UI 커밋/진행 중단(거짓 성공 방지): "
+                  f"{qdetail}", flush=True)
+            return False, f"QUOTA_COOLDOWN: {qdetail}"
+
         try:
             current = self._read_accelerator(page)
             read_err = "" if current is not None else "aria-label 형식 불일치"
@@ -241,6 +264,40 @@ class KaggleUIProvider(KaggleProvider):
         aria = combo.first.get_attribute("aria-label", timeout=10000) or ""
         m = _ACCEL_ARIA_RE.search(aria)
         return m.group(1).strip() if m and m.group(1).strip() else None
+
+    @staticmethod
+    def _page_text(page) -> str:
+        """에디터 페이지 본문 텍스트. 쿼터 배너를 읽기 위한 것.
+
+        ⚠️ DOM 의존: body inner_text 로 통째로 읽는다(쿼터 배너의 정확한 셀렉터는
+           실페이지 없이 확정 못 함 — 실측 검증 필요). 읽기 실패는 '' 로 삼켜
+           쿼터 미감지(=기존 동작)로 떨어뜨린다. 테스트는 이 메서드를 스텁한다.
+        """
+        try:
+            return page.inner_text("body", timeout=5000) or ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _parse_quota_hours(text: str) -> float | None:
+        """페이지 텍스트에서 'Quota: HH:MM / 30 hrs' → 사용시간(h). 없으면 None."""
+        m = _QUOTA_RE.search(text or "")
+        if not m:
+            return None
+        return int(m.group(1)) + int(m.group(2)) / 60.0
+
+    @classmethod
+    def _quota_exhausted(cls, text: str) -> tuple[bool, str]:
+        """쿼터 소진? → (exhausted, detail).
+
+        처방(Fable): 사용시간 ≥30h 이거나 'almost out of quota' 문구가 있으면 소진.
+        """
+        hrs = cls._parse_quota_hours(text)
+        if hrs is not None and hrs >= QUOTA_LIMIT_H:
+            return True, f"GPU 쿼터 소진({hrs:.2f}h ≥ {QUOTA_LIMIT_H:.0f}h)"
+        if _QUOTA_WARN in (text or "").lower():
+            return True, "GPU 쿼터 소진 경고('almost out of quota')"
+        return False, ""
 
     @staticmethod
     def _select_accelerator(page, label: str) -> None:
