@@ -455,15 +455,33 @@ class KaggleProvider(Provider):
         print(line, flush=True)
 
     def stop_kernel(self, kid: str) -> tuple[bool, str]:
-        """실행 중 커널 중지 시도 → (중지됨?, 사유).
+        """실행 중 커널 중지 → (중지됨?, 사유). Playwright UI(Stop 버튼)로 누른다.
 
-        TODO: kaggle CLI 2.2.x 의 `kernels` 하위명령에는 stop/cancel 이 **없다**
-        (list/files/get/init/push/pull/output/status/logs/update/delete/topics).
-        kagglesdk 에는 `KernelsApiService.cancel_kernel_session(kernel_session_id)` 가
-        있지만 필요한 정수 `kernel_session_id` 를 CLI(status) 가 주지 않는다 — 그 id 를
-        얻는 공식 경로가 확인되면 여기서 호출한다. 그때까지는 '못 멈췄다'를 **말만** 한다.
+        kaggle CLI 2.2.x 의 `kernels` 하위명령에는 stop/cancel 이 **없고**
+        (list/files/get/init/push/pull/output/status/logs/update/delete/topics),
+        kagglesdk 의 `cancel_kernel_session(kernel_session_id)` 는 그 정수 id 를 얻는
+        공식 경로가 없다(status API·CLI push 모두 미반환). → kaggle-ui 가 이미 쓰는 방식,
+        저장된 로그인 세션으로 에디터를 열어 Stop 컨트롤을 누른다(kaggle_ui.stop_running_session).
+        실패하면 기존처럼 '못 멈췄다'를 말만 한다(안전 degrade — 수동 Stop 필요).
         """
-        return False, (f"kaggle CLI 에 커널 중지 API 없음 — kernel={kid} 는 원격에서 계속 돌 수 "
+        parts = kid.split("/", 1)
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            return False, (f"kernel id 파싱 실패({kid!r}) — 'user/slug' 형식이 아님. "
+                           f"Kaggle 웹에서 수동 Stop 필요.")
+        user, slug = parts[0].strip(), parts[1].strip()
+        try:
+            from .kaggle_ui import stop_running_session
+        except Exception as e:
+            return False, (f"kaggle-ui 로드 실패({type(e).__name__}) — kernel={kid} 는 "
+                           f"원격에서 계속 돌 수 있다(Kaggle 웹에서 수동 Stop 필요).")
+        try:
+            ok, why = stop_running_session(user, slug)
+        except Exception as e:  # ★10-17: stop_running_session 은 자체 degrade 하지만 어떤 예외도 밖으로 안 나가게(오케스트레이터 보호)
+            return False, (f"kaggle-ui Stop 예외({type(e).__name__}: {e}) — kernel={kid} 는 "
+                           f"원격에서 계속 돌 수 있다(Kaggle 웹에서 수동 Stop 필요).")
+        if ok:
+            return True, f"kaggle-ui Stop 성공(kernel={kid}): {why}"
+        return False, (f"kaggle-ui Stop 실패({why}) — kernel={kid} 는 원격에서 계속 돌 수 "
                        f"있다(Kaggle 웹에서 수동 Stop 필요).")
 
     def _poll_and_fetch(self, job: Job, work: str) -> RunResult:
