@@ -138,3 +138,41 @@ def test_stop_kernel_delegation_failure_degrades(monkeypatch):
     ok, why = prov.stop_kernel("u/s")
     assert ok is False
     assert "수동 Stop 필요" in why and "Stop 컨트롤 못 찾음" in why
+
+
+def test_launch_failure_degrades_not_raises(monkeypatch, tmp_path):
+    # ★10-17(Fable): 크로미움 기동 실패가 try 밖이라 예외 누출되던 버그 — 이제 (False, …)로 degrade.
+    pytest = __import__("pytest")
+    pw = pytest.importorskip("playwright.sync_api")
+
+    class _Chromium:
+        def launch(self, headless=True):
+            raise RuntimeError("Executable doesn't exist")
+
+    class _P:
+        chromium = _Chromium()
+
+    class _CM:
+        def __enter__(self):
+            return _P()
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(UI, "session_is_logged_in", lambda path=None: (True, "ok"))
+    monkeypatch.setattr(pw, "sync_playwright", lambda: _CM())  # from playwright.sync_api import sync_playwright 가 이걸 집는다
+    ok, why = UI.stop_running_session("u", "s", state_path=str(tmp_path / "state.json"))
+    assert ok is False
+    assert "RuntimeError" in why or "Executable" in why
+
+
+def test_stop_kernel_delegation_exception_degrades(monkeypatch):
+    # ★10-17: stop_running_session 이 예외를 던져도 stop_kernel 은 크래시 않고 degrade(오케스트레이터 보호).
+    def _boom(u, s, state_path=None):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(UI, "stop_running_session", _boom)
+    prov = KaggleProvider()
+    ok, why = prov.stop_kernel("u/s")
+    assert ok is False
+    assert "수동 Stop" in why and "예외" in why

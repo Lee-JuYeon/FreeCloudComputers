@@ -474,7 +474,11 @@ class KaggleProvider(Provider):
         except Exception as e:
             return False, (f"kaggle-ui 로드 실패({type(e).__name__}) — kernel={kid} 는 "
                            f"원격에서 계속 돌 수 있다(Kaggle 웹에서 수동 Stop 필요).")
-        ok, why = stop_running_session(user, slug)
+        try:
+            ok, why = stop_running_session(user, slug)
+        except Exception as e:  # ★10-17: stop_running_session 은 자체 degrade 하지만 어떤 예외도 밖으로 안 나가게(오케스트레이터 보호)
+            return False, (f"kaggle-ui Stop 예외({type(e).__name__}: {e}) — kernel={kid} 는 "
+                           f"원격에서 계속 돌 수 있다(Kaggle 웹에서 수동 Stop 필요).")
         if ok:
             return True, f"kaggle-ui Stop 성공(kernel={kid}): {why}"
         return False, (f"kaggle-ui Stop 실패({why}) — kernel={kid} 는 원격에서 계속 돌 수 "

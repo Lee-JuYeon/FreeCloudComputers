@@ -509,10 +509,13 @@ def stop_running_session(user: str, slug: str,
     headful = os.environ.get("FREECLOUD_KAGGLE_HEADFUL") == "1"
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not headful)
-        ctx = browser.new_context(storage_state=path)
-        page = ctx.new_page()
+        browser = ctx = None
         try:
+            # ★10-17(Fable): launch/new_context/new_page 를 try 안으로 — 크로미움 기동 실패가 밖으로
+            #  누출돼 stop_kernel→오케스트레이터가 크래시하던 것 방지. finally 도 None 가드(미정의 NameError 방지).
+            browser = p.chromium.launch(headless=not headful)
+            ctx = browser.new_context(storage_state=path)
+            page = ctx.new_page()
             # networkidle 금지(에디터는 상시 소켓/폴링). _set_t4x2_and_commit 과 동일.
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             page.wait_for_selector("text=Save Version", timeout=60000)
@@ -522,8 +525,10 @@ def stop_running_session(user: str, slug: str,
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
         finally:
-            ctx.close()
-            browser.close()
+            if ctx is not None:
+                ctx.close()
+            if browser is not None:
+                browser.close()
 
 
 def save_login_state(headful: bool = True, timeout_s: int = 300) -> str:
