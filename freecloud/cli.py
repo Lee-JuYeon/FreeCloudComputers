@@ -147,6 +147,20 @@ def _cmd_kaggle_login(args) -> int:
     return 0
 
 
+def _cmd_kaggle_stop(args) -> int:
+    """freecloud kaggle-stop <user/slug> — 실행 중 커널을 UI Stop 버튼으로 중지."""
+    from .providers.kaggle_ui import stop_running_session
+    ref = (args.kernel or "").strip()
+    parts = ref.split("/", 1)
+    if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+        print(f"[FAIL] 'user/slug' 형식이 아님: {ref!r} "
+              f"(예: benedictarthur/freecloud-laibrio-gemma4)")
+        return 1
+    ok, why = stop_running_session(parts[0].strip(), parts[1].strip())
+    print(("[OK] " if ok else "[FAIL] ") + f"{ref}: {why}")
+    return 0 if ok else 1
+
+
 def _cmd_login(args) -> int:
     """freecloud login <provider> — 사이트별 최초 1회 로그인/토큰 등록."""
     from . import auth
@@ -202,6 +216,10 @@ def main(argv=None) -> int:
     sub.add_parser("clouds", help="무료 클라우드 카탈로그").set_defaults(fn=_cmd_clouds)
     sub.add_parser("kaggle-login", help="Kaggle 로그인 저장(kaggle-ui/T4x2용, 1회)"
                    ).set_defaults(fn=_cmd_kaggle_login)
+
+    ks = sub.add_parser("kaggle-stop", help="실행 중 Kaggle 커널 UI Stop(user/slug)")
+    ks.add_argument("kernel", help="user/slug (예: benedictarthur/freecloud-laibrio-gemma4)")
+    ks.set_defaults(fn=_cmd_kaggle_stop)
 
     lg = sub.add_parser("login", help="provider 로그인/토큰 등록(1회)")
     lg.add_argument("provider", help="huggingface|kaggle|colab|modal|lightning|saturn|kaggle-ui")

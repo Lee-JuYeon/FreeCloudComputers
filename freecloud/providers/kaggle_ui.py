@@ -44,6 +44,37 @@ _QUOTA_WARN = "almost out of quota"
 #: 주간 GPU 쿼터 상한(시간). 이 이상 썼으면 소진으로 본다.
 QUOTA_LIMIT_H = 30.0
 
+#: 실행 중 세션을 멈추는 Stop 컨트롤 후보(2026-10-17 추가).
+#: ⚠️ 실측 DOM(2026-10-17 dogfood, benedictarthur/freecloud-laibrio-gemma4 RUNNING 중):
+#:    에디터에 '레이블된 Stop 버튼'은 **없다**. 노출된 실행 관련 컨트롤은
+#:      · button text='fast_forward Run All' (aria='Run All')
+#:      · button text='circle Draft Session off (run a cell to start)'  ← 인터랙티브 세션 토글(현재 off)
+#:      · button text='update 1  View Active Events' (aria-controls="active-events-panel")
+#:    `kaggle kernels push` 가 띄우는 건 '커밋된 배치 런'이라 Draft Session(off)이 아니라
+#:    'View Active Events'(배지 1) 뒤 패널에 뜬다. 그 패널 안에 Stop/Cancel 이 있을 것으로
+#:    보이나, (a) Google 쿠키 동의 오버레이(div.sc-gtcBCx "Kaggle uses cookies from Google…")가
+#:    pointer 이벤트를 가로채 View Active Events 클릭을 막고(닫기 버튼 미발견),
+#:    (b) 패널이 포털 렌더라 headless 에서 열리지 않아 **내부 Stop 셀렉터를 실측 확정 못 함**.
+#:    → 아래는 '레이블된 Stop 버튼' 전제의 best-effort(인터랙티브 세션엔 유효). 커밋 배치 런의
+#:       확정 경로는 headful + 쿠키수락 세션에서 View Active Events 패널을 열어 재확인 필요.
+#:    못 찾으면 안전하게 (False, 사유) — 거짓 성공·무한 탐색 금지.
+_STOP_BUTTON_NAMES = (
+    "Stop Session",
+    "Stop session",
+    "Stop running session",
+    "Cancel Run",
+    "Stop",
+)
+
+#: 중지/유휴로 바뀌었음을 알리는 페이지 텍스트 마커(best-effort, 소문자 비교).
+_STOPPED_MARKERS = (
+    "session stopped",
+    "no active session",
+    "session is not running",
+    "stopped",
+    "idle",
+)
+
 
 def _state_path() -> str:
     """로그인 세션 파일 — 사용자 전역(paths.py). 실행 디렉토리와 무관하게 같은 로그인을 쓴다."""
@@ -377,6 +408,122 @@ class KaggleUIProvider(KaggleProvider):
                 state="hidden", timeout=20000)
         except Exception:
             raise RuntimeError("저장 다이얼로그가 닫히지 않음 — 커밋 제출 실패 가능.")
+
+
+def _body_text(page) -> str:
+    """에디터 본문 텍스트(중지 확인용). 읽기 실패는 '' 로 삼킨다."""
+    try:
+        return page.inner_text("body", timeout=5000) or ""
+    except Exception:
+        return ""
+
+
+def _confirm_stopped(page, clicked_name: str) -> tuple[bool, str]:
+    """Stop 클릭 후 실제로 중지됐는지 확인 → (ok, detail).
+
+    실페이지 DOM 을 확신할 수 없으므로 '거짓 성공'을 피하도록 보수적으로 판정한다.
+    두 신호 중 하나라도 있어야 성공으로 본다:
+      (1) 방금 누른 Stop 버튼이 사라짐(실행 중이 아니면 Stop 컨트롤이 없다).
+      (2) 페이지 텍스트에 중지/유휴 마커.
+    둘 다 없으면 '눌렀지만 확인 못 함'으로 실패 처리(수동 확인 유도).
+    """
+    try:
+        if page.get_by_role("button", name=clicked_name, exact=False).count() == 0:
+            return True, f"stopped (Stop 버튼 사라짐, via '{clicked_name}')"
+    except Exception:
+        pass
+    text = _body_text(page).lower()
+    for m in _STOPPED_MARKERS:
+        if m in text:
+            return True, f"stopped (마커 '{m}', via '{clicked_name}')"
+    return False, "Stop 클릭 후에도 중지/유휴 신호를 못 읽음"
+
+
+def _stop_on_page(page) -> tuple[bool, str]:
+    """에디터가 렌더된 page 에서 실행 중 세션의 Stop 컨트롤을 눌러 중지 → (ok, detail).
+
+    흐름:
+      · (있으면) 세션 패널을 펼친다 — Stop 컨트롤이 접힌 패널 안에 있을 수 있다.
+      · _STOP_BUTTON_NAMES 를 순서대로 찾아, 존재하는 첫 버튼을 클릭.
+      · 확인 다이얼로그가 뜨면 승인(best-effort).
+      · _confirm_stopped 로 실제 중지됐는지 검증.
+    Stop 컨트롤을 하나도 못 찾으면 (False, 사유) — 안전 degrade(무한 탐색·거짓 성공 금지).
+    """
+    # 세션 옵션 패널이 접혀 있으면 펼친다(이미 펼쳐졌거나 버튼이 없으면 무시).
+    try:
+        page.get_by_role("button", name="Expand Session options").click(timeout=5000)
+        page.wait_for_timeout(1000)
+    except Exception:
+        pass
+
+    tried: list[str] = []
+    for name in _STOP_BUTTON_NAMES:
+        loc = page.get_by_role("button", name=name, exact=False)
+        try:
+            present = loc.count() > 0
+        except Exception:
+            present = False
+        if not present:
+            tried.append(name)
+            continue
+        try:
+            loc.first.click(timeout=5000)
+        except Exception as e:
+            tried.append(f"{name}(click:{type(e).__name__})")
+            continue
+        page.wait_for_timeout(2000)
+        # 확인 다이얼로그(세션 중지 안내 등)가 있으면 승인. 없으면 조용히 통과.
+        for confirm in ("Confirm", "OK", "Yes", "Stop Session", "Stop"):
+            try:
+                page.get_by_role("button", name=confirm, exact=False).first.click(timeout=1500)
+                break
+            except Exception:
+                continue
+        page.wait_for_timeout(1500)
+        return _confirm_stopped(page, name)
+
+    return False, ("Stop 컨트롤 못 찾음(실행 중이 아니거나 UI 변경) — 시도: "
+                   + ", ".join(tried))
+
+
+def stop_running_session(user: str, slug: str,
+                         state_path: str | None = None) -> tuple[bool, str]:
+    """실행 중 Kaggle 커널(에디터 세션)을 UI Stop 버튼으로 중지 → (ok, detail).
+
+    kaggle CLI/SDK 에 커널 중지 공식 경로가 없어, 저장된 Playwright 로그인 세션
+    (~/.freecloud/kaggle_state.json)으로 에디터를 열고 Stop 컨트롤을 누른다.
+    토큰(oauth)이 아니라 kaggle-login 세션을 쓴다 — _set_t4x2_and_commit 과 동일 방식.
+    실패 시 (False, 사유) — 안전 degrade(호출부가 '수동 Stop 필요'로 안내).
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return False, "playwright 미설치(pip install 'freecloud[kaggle-ui]')."
+    path = state_path or _state_path()
+    ok, detail = session_is_logged_in(path)
+    if not ok:
+        return False, f"kaggle-login 선행 필요: {detail}"
+    if not user or not slug:
+        return False, f"user/slug 비어 있음(user={user!r}, slug={slug!r})."
+    url = f"https://www.kaggle.com/code/{user}/{slug}/edit"
+    headful = os.environ.get("FREECLOUD_KAGGLE_HEADFUL") == "1"
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=not headful)
+        ctx = browser.new_context(storage_state=path)
+        page = ctx.new_page()
+        try:
+            # networkidle 금지(에디터는 상시 소켓/폴링). _set_t4x2_and_commit 과 동일.
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_selector("text=Save Version", timeout=60000)
+            return _stop_on_page(page)
+        except PWTimeout as e:
+            return False, f"셀렉터 타임아웃(UI 변경 가능): {e}"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+        finally:
+            ctx.close()
+            browser.close()
 
 
 def save_login_state(headful: bool = True, timeout_s: int = 300) -> str:
