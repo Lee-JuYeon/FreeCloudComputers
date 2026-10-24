@@ -652,7 +652,7 @@ def stop_running_session(user: str, slug: str,
     headful = os.environ.get("FREECLOUD_KAGGLE_HEADFUL") == "1"
 
     with sync_playwright() as p:
-        browser = ctx = None
+        browser = ctx = page = None
         try:
             # ★10-17(Fable): launch/new_context/new_page 를 try 안으로 — 크로미움 기동 실패가 밖으로
             #  누출돼 stop_kernel→오케스트레이터가 크래시하던 것 방지. finally 도 None 가드(미정의 NameError 방지).
@@ -668,7 +668,8 @@ def stop_running_session(user: str, slug: str,
             page.wait_for_selector("text=Save Version", timeout=60000)
             return _stop_on_page(page)
         except PWTimeout as e:
-            why = _login_required(page, ctx)
+            # page 는 try 안에서 대입 → launch/new_context 단계 타임아웃이면 미정의. None 가드(설계 검증 메모).
+            why = _login_required(page, ctx) if page is not None else None
             if why:
                 return False, f"LOGIN_REQUIRED: {why} → fcc kaggle-login 후 재실행"
             return False, f"셀렉터 타임아웃(UI 변경 가능): {e}"
