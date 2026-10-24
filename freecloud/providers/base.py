@@ -32,6 +32,11 @@ class Probe:
     available: bool
     reason: str = ""
     cooldown_s: int = 0     # available=False일 때 권장 쿨다운
+    # available=False일 때 실패 성격(예: LOGIN_REQUIRED). **맨 뒤에 기본값과 함께** 둔다 —
+    # 기존 코드·테스트가 Probe(True, "") 처럼 위치인자로 만들기 때문에 중간에 끼우면
+    # 조용히 어긋난다(RunResult.artifacts_dir 와 같은 이유, 불변조건 5). 오케스트레이터는
+    # 이 값이 ABORT 로 분류되면 쿨다운 없이 즉시 종료한다.
+    error_class: str = ""
 
 
 @dataclass

@@ -58,6 +58,28 @@ def test_skip_when_unavailable(monkeypatch):
     assert a.calls == 0                        # probe 실패 → run 안 함
 
 
+def test_probe_login_required_aborts_without_cooldown(monkeypatch):
+    """probe 가 LOGIN_REQUIRED(ABORT)를 알리면 쿨다운·대기 없이 즉시 종료(설계 §3·T15).
+
+    L0 를 넣으면 단일 provider(kaggle-ui)가 만료됐을 때 '전부 쿨다운 → 1800s 대기'를 라운드마다
+    반복해 약 1시간 헛대기가 되던 경로가 새로 열린다 — 그 경로를 막는다."""
+    class LoginExpired(Fake):
+        def probe(self):
+            self.probes = getattr(self, "probes", 0) + 1
+            return Probe(False, "브라우저 로그인 만료 → fcc kaggle-login", error_class="LOGIN_REQUIRED")
+
+    a = LoginExpired("kaggle-ui", [])
+    _wire(monkeypatch, {"kaggle-ui": a}, ["kaggle-ui"])
+    slept: list = []
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda s: slept.append(s))
+    res = orchestrator.run(_job(), max_rounds=3)
+    assert not res["ok"] and res["provider"] is None
+    assert slept == []                                     # 헛대기 없음
+    assert a.calls == 0                                    # run 은 안 불린다
+    assert state.cooldown_remaining("kaggle-ui") == 0      # 쿨다운도 안 건다
+    assert res["attempts"][0]["error_class"] == "LOGIN_REQUIRED"
+
+
 def test_fits_filters_vram(monkeypatch):
     small = Fake("small", [RunResult(True, "done", "ok")])
     small.capabilities = {"gpu": "T4", "vram_gb": 8, "headless": True}

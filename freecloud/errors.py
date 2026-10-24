@@ -67,6 +67,17 @@ _PLAYBOOK: list[tuple[str, str, str, str, int]] = [
     (r"no slot|all .* busy|(?:at|over|no) capacity|queue(?:d)? too long|slot .* wait",
      "NO_SLOT", FAILOVER, "무료 슬롯이 꽉 참. 다음 provider로.", 900),
 
+    # ── kaggle-ui 브라우저 로그인 만료/부재 → 사람이 1회 재로그인(2026-10-24 수리) ──────
+    # 근본원인: Kaggle 웹 세션 쿠키 __Host-KAGGLEID 수명이 14일이라, 30일짜리 CLIENT-TOKEN
+    # JWT 만 보던 기존 파일검사가 16일 된 세션을 "로그인됨"으로 통과시켰다. 쿠키 파일은
+    # provider 공통이라 FAILOVER/RETRY 는 쿼터·시간만 태운다 → ABORT. 쿨다운 0 이라
+    # 재로그인(fcc kaggle-login) 직후 재실행이 막히지 않는다. ⚠️ TRANSIENT(timeout) 위에 둔다 —
+    # 'LOGIN_REQUIRED: …셀렉터 타임아웃…' 이 TRANSIENT 로 오분류되지 않게(설계 §3·T14).
+    (r"login_required",
+     "LOGIN_REQUIRED", ABORT, "Kaggle 브라우저 로그인 만료/부재 → `fcc kaggle-login`"
+     "(약 1분, 브라우저) 후 재실행. kaggle CLI OAuth(credentials.json)는 별개로 자동 "
+     "갱신된다 — 다시 할 필요 없음.", 0),
+
     # ── 인증/설정: 페일오버해도 같은 결과 → 사람 개입 ────────────────────────
     (r"gated repo|401|403|unauthorized|invalid .*token|authentication|permission denied",
      "AUTH", ABORT, "인증 실패(토큰/gated repo). provider Secret·HF/Kaggle 토큰 확인 필요.", 0),

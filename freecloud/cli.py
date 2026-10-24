@@ -58,6 +58,15 @@ def _cmd_run(args) -> int:
         from . import auth
         auth.ensure_for_job(job, order, interactive=True)  # cloudflare 스타일 온디맨드 로그인
     result = orchestrator.run(job, once=args.once, max_rounds=args.rounds)
+    # 소비자(예: Laibrio run_fcc)가 stdout 을 흘려보내도 결과를 읽을 수 있게 파일로도 쓴다 —
+    # detached/timeout(커널이 떴다는 증거) 과 LOGIN_REQUIRED/AUTH(커널이 못 떴다)를 구분해
+    # 헛대기(wait-final 13h)를 막는다(설계 §5).
+    if getattr(args, "result_json", None):
+        try:
+            with open(args.result_json, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[warn] --result-json 쓰기 실패({type(e).__name__}): {args.result_json}", flush=True)
     print("\n===== RESULT =====")
     print(json.dumps(result, ensure_ascii=False, indent=2))
     if not args.quiet:
@@ -203,6 +212,8 @@ def main(argv=None) -> int:
                    help="온디맨드 로그인 프롬프트 끔(CI/무인)")
     r.add_argument("--quiet", action="store_true",
                    help="실패 상세(error_class/reason/로그 꼬리) 출력 끔")
+    r.add_argument("--result-json", metavar="PATH",
+                   help="결과 dict(JSON)를 이 파일에도 쓴다(소비자가 detached/LOGIN_REQUIRED 를 구분)")
     r.set_defaults(fn=_cmd_run)
 
     lo = sub.add_parser("logs", help="Kaggle 커널 상태 + 산출물/로그 꼬리")

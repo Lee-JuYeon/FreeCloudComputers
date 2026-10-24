@@ -32,6 +32,15 @@ freecloud login kaggle-ui     # 브라우저 뜸 → Kaggle 로그인 → ~/.fre
 
 쿠키는 며칠~몇 주 뒤 만료됩니다. `freecloud auth`가 만료를 감지하면 다시 로그인하세요.
 
+> 🔑 **kaggle-ui 쿠키 수명 = 14일**(2026-10-24 실측). Kaggle 웹 세션 쿠키
+> `__Host-KAGGLEID`가 14일이면 만료됩니다. fcc 는 이 쿠키의 만료일을 파일에서 바로 읽어
+> (`fcc auth`/`fcc providers` 줄에 `만료 YYYY-MM-DD(N일 남음)` 표시) 만료되었거나 2일 이내면
+> **LOGIN_REQUIRED**(ABORT)로 즉시 끝냅니다 — 페일오버·재시도로 쿼터를 태우지 않습니다.
+> 조치는 `freecloud kaggle-login` 한 번(약 1분, 브라우저). ⚠️ 과거 버전은 수명 30일인
+> `CLIENT-TOKEN`(JWT)만 봐서 16일 된 세션을 "로그인됨"으로 통과시켜 런타임에 404로 죽었습니다.
+> kaggle CLI OAuth(`~/.kaggle/credentials.json`)는 이와 **별개**로 실행 시 자동 갱신되므로
+> 다시 로그인할 필요가 없습니다.
+
 ## 상태 확인
 ```bash
 freecloud auth      # 모든 provider 인증 상태 + 저장된 시크릿 이름

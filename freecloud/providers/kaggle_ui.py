@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 
 from ..job import Job
 from .base import Probe, RunResult
@@ -32,6 +33,13 @@ from .. import paths
 
 #: 원하는 가속기 옵션 라벨(실측 DOM 의 role=option name).
 T4X2_LABEL = "GPU T4 x2"
+
+#: Kaggle 웹 세션 쿠키 — 수명 **14일**(2026-10-24 실측). 로그인 만료의 진짜 지표다.
+#: 기존 파일검사는 CLIENT-TOKEN(JWT, 수명 30일)만 봐서 16일 된 세션을 "로그인됨"으로
+#: 통과시켰다(근본원인). L0 파일검사는 이 쿠키의 expires 를 본다.
+LOGIN_COOKIE = "__Host-KAGGLEID"
+#: 만료 임박 마진(초). 커밋은 push·데이터셋 대기 뒤 수 분 뒤라 30분 여유를 둔다.
+LOGIN_EXPIRY_MARGIN_S = 1800
 
 _ACCEL_ARIA_RE = re.compile(r"Select Accelerator\.\s*(.*?)\s*currently selected", re.S)
 
@@ -129,23 +137,139 @@ def _is_browser_closed(exc: BaseException) -> bool:
             or "target closed" in low)
 
 
-def session_is_logged_in(path: str | None = None) -> tuple[bool, str]:
-    """저장된 storage_state가 '실제 로그인된' 세션인지 → (ok, detail)."""
+@dataclass
+class LoginStatus:
+    """L0 파일검사 결과. detail 은 fcc auth/providers/run 이 그대로 찍는 사람용 한 줄."""
+    ok: bool
+    detail: str
+    expires_at: float | None = None   # __Host-KAGGLEID(없으면 CLIENT-TOKEN) 만료 epoch 초
+    days_left: float | None = None    # 만료까지 남은 일수(없으면 None)
+    stale: bool = False               # ok 의 반대(명시용) — 만료/부재/손상이면 True
+
+
+def _kaggleid_expiry(cookies) -> float | None:
+    """__Host-KAGGLEID 쿠키의 expires(epoch 초). 없거나 세션쿠키(-1)/파싱불가면 None."""
+    for c in cookies or []:
+        if (c.get("name") if isinstance(c, dict) else None) != LOGIN_COOKIE:
+            continue
+        try:
+            exp = float(c.get("expires"))
+        except (TypeError, ValueError):
+            return None
+        return exp if exp > 0 else None
+    return None
+
+
+def _client_token_exp(cookies) -> float | None:
+    """CLIENT-TOKEN(JWT)의 exp 클레임(epoch 초). 없거나 파싱불가면 None(서명 검증 안 함)."""
+    import base64
     import json
+    for c in cookies or []:
+        if (c.get("name") if isinstance(c, dict) else None) != "CLIENT-TOKEN":
+            continue
+        try:
+            payload = c["value"].split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload))
+            exp = data.get("exp")
+            return float(exp) if exp is not None else None
+        except Exception:
+            return None
+    return None
+
+
+def _fmt_day(epoch: float) -> str:
+    import datetime
+    return datetime.datetime.fromtimestamp(epoch).strftime("%Y-%m-%d")
+
+
+def _fmt_md(epoch: float) -> str:
+    import datetime
+    return datetime.datetime.fromtimestamp(epoch).strftime("%m-%d")
+
+
+def browser_login_status(path: str | None = None) -> LoginStatus:
+    """저장된 storage_state 가 '아직 유효한 로그인'인지 **파일만 보고**(비용 0) 판정 → LoginStatus.
+
+    판정 순서(설계 §2 L0):
+      파일 없음/손상 → stale. CLIENT-TOKEN anon True → stale(기존).
+      __Host-KAGGLEID 가 **있고** expires ≤ now+margin → stale(만료 YYYY-MM-DD, 저장 MM-DD).
+      CLIENT-TOKEN JWT exp 가 **있고** 지났으면 → stale.
+      둘 다 **없으면** 통과 + 경고(쿠키 이름이 바뀐 경우 — 없음을 만료로 보지 않는다. 라이브
+      검사 L1 이 goto 1회 비용으로 받는다).
+    """
+    import json
+    import time
     path = path or _state_path()
     if not os.path.exists(path):
-        return False, f"로그인 상태 없음 → 'fcc kaggle-login' 실행({path})."
+        return LoginStatus(False, f"로그인 상태 없음 → 'fcc kaggle-login' 실행({path}).",
+                           stale=True)
     try:
         with open(path, encoding="utf-8") as f:
             state = json.load(f)
     except Exception as e:
-        return False, f"상태 파일 손상({type(e).__name__}) → 'fcc kaggle-login' 재실행."
-    anon = _cookie_says_anon(state.get("cookies"))
-    if anon is True:
-        return False, "저장된 세션이 익명(미로그인) → 'fcc kaggle-login' 재실행."
-    if anon is None:
-        return False, "세션에 CLIENT-TOKEN 없음(미로그인 추정) → 'fcc kaggle-login' 재실행."
-    return True, "로그인된 세션."
+        return LoginStatus(False, f"상태 파일 손상({type(e).__name__}) → 'fcc kaggle-login' 재실행.",
+                           stale=True)
+    cookies = state.get("cookies")
+    if _cookie_says_anon(cookies) is True:
+        return LoginStatus(False, "저장된 세션이 익명(미로그인) → 'fcc kaggle-login' 재실행.",
+                           stale=True)
+    now = time.time()
+    exp = _kaggleid_expiry(cookies)
+    if exp is not None:
+        days_left = (exp - now) / 86400.0
+        if exp <= now + LOGIN_EXPIRY_MARGIN_S:
+            saved = os.path.getmtime(path)
+            return LoginStatus(
+                False,
+                f"브라우저 로그인 만료({LOGIN_COOKIE} {_fmt_day(exp)} 만료·저장 {_fmt_md(saved)}) → "
+                "fcc kaggle-login 후 재실행. (kaggle CLI OAuth 는 별개·자동갱신)",
+                expires_at=exp, days_left=days_left, stale=True)
+        return LoginStatus(
+            True, f"브라우저 로그인 OK — 만료 {_fmt_day(exp)}({days_left:.1f}일 남음)",
+            expires_at=exp, days_left=days_left, stale=False)
+    jwt_exp = _client_token_exp(cookies)
+    if jwt_exp is not None and jwt_exp <= now:
+        return LoginStatus(
+            False,
+            f"브라우저 로그인 만료(CLIENT-TOKEN {_fmt_day(jwt_exp)} 만료) → fcc kaggle-login 후 재실행. "
+            "(kaggle CLI OAuth 는 별개·자동갱신)",
+            expires_at=jwt_exp, days_left=(jwt_exp - now) / 86400.0, stale=True)
+    # 만료 지표가 둘 다 없음 — 쿠키 이름 변경 가능성. 만료로 보지 않고 통과 + 경고(L1 이 받는다).
+    print(f"[kaggle-ui] ⚠️ 세션에 {LOGIN_COOKIE}/CLIENT-TOKEN exp 둘 다 없음 — 쿠키 형식 변경 "
+          "가능. 파일검사는 통과시키고 라이브 검사(L1)로 넘긴다.", flush=True)
+    return LoginStatus(True, "브라우저 로그인 OK(만료 정보 없음 — 쿠키 형식 변경 가능).", stale=False)
+
+
+def session_is_logged_in(path: str | None = None) -> tuple[bool, str]:
+    """저장된 storage_state가 '실제 로그인된' 세션인지 → (ok, detail).
+
+    browser_login_status 를 (ok, detail)로 감싼 것 — 기존 호출부(probe/run/stop/테스트)의
+    시그니처를 그대로 유지한다. 만료일·남은 일수가 필요하면 browser_login_status 를 직접 쓴다.
+    """
+    st = browser_login_status(path)
+    return st.ok, st.detail
+
+
+def _login_required(page, ctx) -> str | None:
+    """라이브 로그인 만료/부재 감지(L1·L2) → 사유 문자열 또는 None.
+
+    설계 §2: ① CLIENT-TOKEN anon 쿠키가 True(로그인 만료/익명) ② 최종 URL 이 `/edit` 탈락
+    (익명 컨텍스트로 에디터를 열면 404 로 리다이렉트된다 — 2026-10-24 실측). 둘 중 하나면
+    사유를 돌려준다. DOM 텍스트('Sign In')엔 기대지 않는다. 읽기 실패는 조용히 넘긴다.
+    """
+    try:
+        if _cookie_says_anon(ctx.cookies()) is True:
+            return "익명 세션 쿠키(로그인 만료)"
+    except Exception:
+        pass
+    try:
+        url = page.url
+    except Exception:
+        url = ""
+    if "/edit" not in (url or ""):
+        return f"에디터 리다이렉트(최종 URL={url!r}) — 로그인 필요 추정"
+    return None
 
 
 class KaggleUIProvider(KaggleProvider):
@@ -166,20 +290,24 @@ class KaggleUIProvider(KaggleProvider):
             return base
         if self._pw() is None:
             return Probe(False, "playwright 미설치(pip install 'freecloud[kaggle-ui]' && playwright install chromium).")
-        # ⚠️ 파일 존재만 보면 '익명 세션'이 통과해 실패가 AUTH가 아닌 UI_AUTOMATION으로
-        #    오분류된다(실측 2026-07-20). 세션 내용까지 검사한다.
+        # ⚠️ 파일 존재만 보면 '익명/만료 세션'이 통과해 실패가 LOGIN_REQUIRED 가 아닌
+        #    UI_AUTOMATION 으로 오분류된다(2026-07-20·10-24 실측). session_is_logged_in 이
+        #    쿠키 만료(14일)까지 본다(browser_login_status 를 감싼 것 — 호출부 무변경).
         ok, detail = session_is_logged_in(_state_path())
         if not ok:
-            return Probe(False, detail)
-        return Probe(True, "kaggle-ui 준비 OK(Playwright + 저장된 로그인).")
+            return Probe(False, detail, error_class="LOGIN_REQUIRED")
+        # 닥터: 만료일·남은 일수를 그대로 노출(fcc auth/providers 가 이 줄을 찍는다, 설계 §5).
+        return Probe(True, f"kaggle-ui 준비 OK(Playwright) — {detail}")
 
     def run(self, job: Job) -> RunResult:
         if self._pw() is None:
             return RunResult(False, "error", "playwright 미설치.", error_class="JOB_CONFIG")
+        # L0 파일검사(비용 0, push·업로드 前). 만료/부재면 LOGIN_REQUIRED(ABORT) 로 즉시 끝낸다 —
+        # 쿠키 파일은 provider 공통이라 페일오버해도 똑같이 막힌다(설계 §3). session_is_logged_in 이
+        # 쿠키 만료(14일)까지 본다(browser_login_status 를 감싼 것 — 호출부 무변경).
         ok, detail = session_is_logged_in(_state_path())
         if not ok:
-            return RunResult(False, "needs_setup", f"kaggle-login 선행 필요: {detail}",
-                             error_class="AUTH")
+            return RunResult(False, "needs_setup", detail, error_class="LOGIN_REQUIRED")
         # 1) 코드 push(커널 등록) — workdir 업로드·dataset_sources 배선은 부모 헬퍼가
         #    한다(설계 §3: kaggle-ui 는 재사용만으로 결함 A 가 자동 적용돼야 한다).
         work, staged_err = self._stage_and_write(job)
@@ -198,6 +326,11 @@ class KaggleUIProvider(KaggleProvider):
             if why.startswith("QUOTA_COOLDOWN"):
                 return RunResult(False, "quota", f"GPU 쿼터 소진: {why}",
                                  error_class="QUOTA_COOLDOWN")
+            # 라이브(L1/L2)에서 로그인 만료/부재가 드러나면 LOGIN_REQUIRED(ABORT). UI 변경과
+            # 분리된다 — 진짜 DOM 변경은 아래 UI_AUTOMATION 으로 그대로 드러난다(설계 §2.L2).
+            if why.startswith("LOGIN_REQUIRED"):
+                return RunResult(False, "needs_setup", f"브라우저 로그인 만료/부재: {why}",
+                                 error_class="LOGIN_REQUIRED")
             return RunResult(False, "needs_setup", f"UI 자동화 실패: {why}",
                              error_class="UI_AUTOMATION")
         ui_commit = "skipped" if why.startswith("skipped") else "committed"
@@ -224,10 +357,20 @@ class KaggleUIProvider(KaggleProvider):
                 # ⚠️ networkidle 금지 — Kaggle 에디터는 웹소켓/폴링이 상시 열려 있어
                 #    '유휴'가 영원히 오지 않는다(실측: goto 60s 타임아웃 3연속).
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                # L1: 셀렉터 60s 대기 **전에** 로그인 만료/부재를 잡는다 — 만료면 에디터가
+                #     영원히 안 떠 아래 wait 가 타임아웃으로만 보일 뿐이다(설계 §2.L1).
+                why = _login_required(page, ctx)
+                if why:
+                    return False, f"LOGIN_REQUIRED: {why} → fcc kaggle-login 후 재실행"
                 # SPA가 에디터를 렌더할 때까지는 별도로 기다린다.
                 page.wait_for_selector("text=Save Version", timeout=60000)
                 return self._commit_on_page(page)
             except PWTimeout as e:
+                # L2: 타임아웃이 사실은 로그인 만료인지 재판정. 아니면 기존 메시지 유지 →
+                #     진짜 DOM 변경은 UI_AUTOMATION 으로 그대로 드러난다(분리 보장).
+                why = _login_required(page, ctx)
+                if why:
+                    return False, f"LOGIN_REQUIRED: {why} → fcc kaggle-login 후 재실행"
                 return False, f"셀렉터 타임아웃(UI 변경 가능): {e}"
             except Exception as e:
                 return False, f"{type(e).__name__}: {e}"
@@ -518,9 +661,16 @@ def stop_running_session(user: str, slug: str,
             page = ctx.new_page()
             # networkidle 금지(에디터는 상시 소켓/폴링). _set_t4x2_and_commit 과 동일.
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # L1: 로그인 만료/부재면 에디터가 안 떠 Stop 셀렉터만 타임아웃으로 보인다(설계 §2.L1).
+            why = _login_required(page, ctx)
+            if why:
+                return False, f"LOGIN_REQUIRED: {why} → fcc kaggle-login 후 재실행"
             page.wait_for_selector("text=Save Version", timeout=60000)
             return _stop_on_page(page)
         except PWTimeout as e:
+            why = _login_required(page, ctx)
+            if why:
+                return False, f"LOGIN_REQUIRED: {why} → fcc kaggle-login 후 재실행"
             return False, f"셀렉터 타임아웃(UI 변경 가능): {e}"
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
@@ -608,6 +758,12 @@ def save_login_state(headful: bool = True, timeout_s: int = 300) -> str:
     # ⚠️ Windows 콘솔(cp949)은 이모지를 못 찍는다 — 여기서 UnicodeEncodeError로 죽으면
     #    로그인이 성공했는데도 실패처럼 보인다(실측 2026-07-20). CLI 출력은 ASCII로.
     if ok:
+        # 예전 실패(LOGIN_REQUIRED 등)가 남긴 쿨다운이 재로그인 뒤 실행을 막지 않게 해제한다(설계 §3).
+        try:
+            from .. import state as _state
+            _state.clear_cooldown("kaggle-ui")
+        except Exception:
+            pass
         print(f"[OK] 로그인 확인 + 상태 저장됨 -> {_state_path()}")
     else:
         print(f"[FAIL] {timeout_s}초 내 로그인 감지 실패 - 저장은 했지만 미로그인 상태일 수 있음 "

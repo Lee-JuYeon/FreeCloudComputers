@@ -158,3 +158,15 @@ def test_stale_kernel_failover():
     d = classify("STALE_KERNEL: push(rc=0) 가 새 세션을 못 띄움(쿼터 소진 추정)")
     assert d.error_class == "STALE_KERNEL"
     assert d.action == FAILOVER and d.cooldown_s > 0
+
+
+# ── kaggle-ui 브라우저 로그인 만료 LOGIN_REQUIRED (2026-10-24, 설계 §3·T14) ──────
+def test_login_required_aborts_and_beats_timeout():
+    """'LOGIN_REQUIRED …timeout…' 은 TRANSIENT(timeout, RETRY)보다 먼저 잡혀 ABORT·쿨다운 0.
+
+    L2 타임아웃 재판정이 로그인 만료를 LOGIN_REQUIRED 로 바꿔도, 그 문자열의 'timeout' 이
+    TRANSIENT 로 오분류돼 같은 provider 를 재시도(쿼터 소모)하면 안 된다."""
+    d = classify("LOGIN_REQUIRED: 익명 세션 쿠키(로그인 만료) selector timeout → fcc kaggle-login")
+    assert d.error_class == "LOGIN_REQUIRED"
+    assert d.action == ABORT
+    assert d.cooldown_s == 0

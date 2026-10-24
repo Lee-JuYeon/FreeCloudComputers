@@ -127,6 +127,15 @@ def run(job: Job, once: bool = False, max_rounds: int = 3) -> dict:
 
             pr = prov.probe()
             if not pr.available:
+                # probe 가 ABORT 성격(예: LOGIN_REQUIRED)을 알리면 쿨다운·페일오버 없이 즉시 종료 —
+                # 쿠키 파일 만료 같은 건 다른 provider 로 가도 같고, 단일 provider 면 "전부 쿨다운 →
+                # 1800s 대기"를 라운드마다 반복해 약 1시간 헛대기가 된다(설계 §3, L0 와 함께 수리).
+                if pr.error_class and classify(pr.error_class).action == ABORT:
+                    attempts.append(dict(provider=name, ok=False, error_class=pr.error_class,
+                                         reason=pr.reason))
+                    print(f"[orch] {name} probe 중단({pr.error_class}): {pr.reason}", flush=True)
+                    return dict(ok=False, provider=None, reason=f"[{name}] {pr.reason}",
+                                attempts=attempts)
                 secs = pr.cooldown_s or 1800
                 state.set_cooldown(name, secs, pr.reason)
                 attempts.append(dict(provider=name, ok=False, error_class="UNAVAILABLE",
