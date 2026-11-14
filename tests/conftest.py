@@ -11,6 +11,25 @@ os.environ.setdefault("PYTHONUTF8", "1")
 def pytest_configure(config):
     config.addinivalue_line(
         "markers", "allow_hf: latest_checkpoint_commit 블록(_block_hf_checkpoint)을 건너뛴다")
+    config.addinivalue_line(
+        "markers", "real_stop: stop_running_session 기본 차단을 건너뛴다(가짜 playwright 로 실함수 검증)")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_kaggle_session(request, monkeypatch, tmp_path):
+    """kaggle 로그인 세션을 테스트별로 격리하고 실수로 **진짜 브라우저가 뜨는 것**을 막는다.
+
+    · FREECLOUD_KAGGLE_STATE 를 테스트별 tmp 로 지정 — 세션공유 임시홈의 kaggle_state.json 을
+      한 테스트가 써두면 뒤 테스트의 진짜 stop_kernel 이 그 쿠키로 Chromium 을 띄우려 했다.
+    · kaggle_ui.stop_running_session 을 기본 차단(Playwright 기동 0 보장). 실제 위임을 검증하는
+      테스트는 자체 monkeypatch 로 덮어쓴다(나중 setattr 가 이긴다)."""
+    monkeypatch.setenv("FREECLOUD_KAGGLE_STATE", str(tmp_path / "kaggle_state.json"))
+    if request.node.get_closest_marker("real_stop"):
+        return          # 실 stop_running_session 을 가짜 playwright 로 검증하는 테스트
+    from freecloud.providers import kaggle_ui as _UI
+    monkeypatch.setattr(_UI, "stop_running_session",
+                        lambda *a, **k: (False, "테스트: stop_running_session 차단(브라우저 미기동)"),
+                        raising=False)
 
 
 @pytest.fixture(autouse=True)

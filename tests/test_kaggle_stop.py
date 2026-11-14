@@ -140,6 +140,10 @@ def test_stop_kernel_delegation_failure_degrades(monkeypatch):
     assert "수동 Stop 필요" in why and "Stop 컨트롤 못 찾음" in why
 
 
+import pytest as _pytest  # noqa: E402
+
+
+@_pytest.mark.real_stop
 def test_launch_failure_degrades_not_raises(monkeypatch, tmp_path):
     # ★10-17(Fable): 크로미움 기동 실패가 try 밖이라 예외 누출되던 버그 — 이제 (False, …)로 degrade.
     pytest = __import__("pytest")
