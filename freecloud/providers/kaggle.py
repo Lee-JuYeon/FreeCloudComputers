@@ -49,6 +49,13 @@ HEARTBEAT_S = 600
 #: 이 문자열이 status 에 있으면 커널이 아직 살아 있다(완료/오류 전).
 _ALIVE_MARKERS = ("running", "queued")
 
+#: kaggle kernels status 가 내보내는 **알려진 상태어**(소문자). _parse_status 는 이 집합 밖의
+#: 값을 '못 읽음'('')으로 떨어뜨려, 슬러그/잡음에서 주운 엉뚱한 낱말을 상태로 오인하지 않는다.
+_STATUS_WORDS = frozenset({
+    "queued", "running", "complete", "error",
+    "cancel_requested", "cancel_acknowledged", "new_script",
+})
+
 # ── 무진행 워치독(A, 2026-11-14) ─────────────────────────────────────────────
 # 'running' 인데 HF checkpoint 가 오래 갱신 안 되면(진행신호 없음) 좀비/데드락이다 —
 # 쿼터만 태운다. checkpoint_repo 가 있을 때만(결과를 받을 곳이 있을 때만) 켜고, env 로 끈다.
@@ -577,17 +584,20 @@ class KaggleProvider(Provider):
 
     @staticmethod
     def _parse_status(rc: int, st: str) -> str:
-        """판정용 **엄격** 상태 파서 → 소문자 상태어 또는 ''(못 읽음).
+        """판정용 **엄격** 상태 파서 → 알려진 소문자 상태어 또는 ''(못 읽음).
 
-        rc==0 이고 `status "<word>"` 패턴이 매치될 때만 그 상태어를 돌려준다. 그 외(네트워크
-        오류 rc!=0, 패턴 불일치)는 '' — 호출부는 '못 읽음'으로 처리한다(blind). _status_word
-        의 꼬리60자 폴백을 쓰지 않는 게 핵심이다(설계 §C2: 부분문자열 종결 오독 차단)."""
+        kaggle CLI 2.2.x 의 kernels_status 는 **항상** `'%s has status "%s"' % (ref, status)`
+        포맷으로 찍는다. 그래서 (1) 앵커를 `has status "<...>"` 로 고정해 슬러그 안의 'status'
+        (예: ref 가 `…/freecloud-check-status`)에 오매치되지 않게 하고, (2) 캡처한 값이 **알려진
+        상태어** 중 하나일 때만 인정한다 — 그 외/rc!=0/불일치는 '' 로 '못 읽음' 처리(blind).
+        _status_word 의 꼬리60자 폴백은 판정에 쓰지 않는다(설계 §C2·Fable 수정#2)."""
         if rc != 0:
             return ""
-        m = re.search(r'status\s+"?([A-Za-z_.]+)"?', st or "")
+        m = re.search(r'has status "([^"]+)"', st or "")
         if not m:
             return ""
-        return m.group(1).rsplit(".", 1)[-1].lower()
+        word = m.group(1).rsplit(".", 1)[-1].lower()
+        return word if word in _STATUS_WORDS else ""
 
     def _heartbeat(self, job: Job, kid: str, elapsed: float, st: str,
                    blind: int = 0, wd: "_NoProgressWatchdog | None" = None) -> None:

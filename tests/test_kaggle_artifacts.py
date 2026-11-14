@@ -35,8 +35,8 @@ def _wire(monkeypatch, tmp_path, status_text, outputs=None):
     def fake_sh(cmd, timeout, env=None, cwd=None):
         calls.append(list(cmd))
         if cmd[:3] == ["kaggle", "kernels", "status"]:
-            # 실제 CLI 포맷으로 감싼다(엄격파서 _parse_status 가 'status "<word>"' 를 본다).
-            return 0, f'status "{status_text}"'
+            # 실제 CLI 포맷(`<ref> has status "<word>"`)으로 감싼다(_parse_status 앵커).
+            return 0, f'someone/freecloud-art has status "{status_text}"'
         if cmd[:3] == ["kaggle", "kernels", "output"]:
             dest = cmd[cmd.index("-p") + 1]
             os.makedirs(dest, exist_ok=True)

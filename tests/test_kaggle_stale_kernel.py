@@ -66,7 +66,7 @@ def test_push_stale_when_lastruntime_unchanged(monkeypatch, capsys):
         if "kernels list" in j:
             return 0, _csv_for(kid, "2026-10-16 09:00:00")   # 항상 동일 → 변화 없음
         if "kernels status" in j:
-            return 0, 'status "complete"'                    # 그대로 complete
+            return 0, 'x has status "complete"'              # 그대로 complete
         return 0, "ready"
     monkeypatch.setattr(p, "_sh", fake_sh)
 
@@ -92,7 +92,7 @@ def test_push_healthy_when_new_run_started(monkeypatch):
             lrt = "2026-10-16 10:00:00" if st["pushed"] else "2026-10-16 09:00:00"
             return 0, _csv_for(kid, lrt)                     # push 후 바뀜 → 새 run
         if "kernels status" in j:
-            return 0, 'status "complete"'
+            return 0, 'x has status "complete"'
         return 0, "ready"
     monkeypatch.setattr(p, "_sh", fake_sh)
 
@@ -114,7 +114,8 @@ def test_push_healthy_when_status_running(monkeypatch):
         if "kernels list" in j:
             return 0, _csv_for(kid, "2026-10-16 09:00:00")
         if "kernels status" in j:
-            return 0, 'status "running"' if st["pushed"] else 'status "complete"'
+            return 0, ('x has status "running"' if st["pushed"]
+                       else 'x has status "complete"')
         return 0, "ready"
     monkeypatch.setattr(p, "_sh", fake_sh)
 
