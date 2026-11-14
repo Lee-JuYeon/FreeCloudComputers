@@ -7,8 +7,10 @@ kaggle CLI·네트워크 0 — 지문/스테이징/푸시를 전부 몽키패치
 from __future__ import annotations
 
 from freecloud.job import Job
+from freecloud.providers import kaggle_ui as UI
 from freecloud.providers.base import RunResult
 from freecloud.providers.kaggle import KaggleProvider
+from freecloud.providers.kaggle_ui import KaggleUIProvider
 
 
 def _job(**kw):
@@ -70,3 +72,24 @@ def test_run_unreadable_signature_proceeds(monkeypatch):
     n = _instrument(monkeypatch, p, "")
     res = p.run(_job())
     assert res.ok is True and n == {"stage": 1, "push": 1}
+
+
+# ── kaggle-ui run(): busy 면 preflight·stage·push 전부 0회 ───────────────────
+def test_kaggle_ui_run_busy_skips_preflight_stage_push(monkeypatch):
+    p = KaggleUIProvider.__new__(KaggleUIProvider)
+    monkeypatch.setattr(p, "_pw", lambda: object())
+    monkeypatch.setattr(UI, "session_is_logged_in", lambda path=None: (True, "ok"))
+    monkeypatch.setattr(p, "_user", lambda: "someone")
+    monkeypatch.setattr(p, "_kernel_run_signature", lambda kid: ("lrt", "running"))
+    n = {"preflight": 0, "stage": 0, "push": 0}
+    monkeypatch.setattr(p, "_browser_preflight",
+                        lambda job, ke: (n.__setitem__("preflight", n["preflight"] + 1),
+                                         (True, "ok", None))[1])
+    monkeypatch.setattr(p, "_stage_and_write",
+                        lambda job: (n.__setitem__("stage", n["stage"] + 1), ("work", None))[1])
+    monkeypatch.setattr(p, "_push",
+                        lambda work, job, before=None: (n.__setitem__("push", n["push"] + 1),
+                                                        (0, "pushed"))[1])
+    res = p.run(_job())
+    assert res.error_class == "KERNEL_BUSY" and res.remote_alive is True
+    assert n == {"preflight": 0, "stage": 0, "push": 0}
