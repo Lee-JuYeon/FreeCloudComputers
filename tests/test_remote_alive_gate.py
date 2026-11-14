@@ -59,6 +59,18 @@ def test_remote_alive_beats_abort_classification(monkeypatch):
     assert res.get("remote_alive") is True and b.calls == 0
 
 
+def test_remote_alive_blocks_retry_even_when_reason_is_retryable(monkeypatch):
+    # error_class 없이 reason='timeout' → classify=RETRY. 하지만 remote_alive=True 면
+    # _run_with_retry 의 재시도 게이트가 **호출 1회**로 막아야 한다(원격 세션 보호).
+    alive = RunResult(False, "timeout", "timeout", "", "", remote_alive=True)
+    a = _Fake("a", [alive])      # 재시도되면 2번째 호출은 기본값(ok=True)을 돌려준다
+    b = _Fake("b", [RunResult(True, "done", "ok")])
+    _wire(monkeypatch, a, b)
+    res = orchestrator.run(Job(name="t", entrypoint="x"), max_rounds=3)
+    assert a.calls == 1                                  # RETRY 가 아니라 즉시 멈춤
+    assert res.get("remote_alive") is True and b.calls == 0
+
+
 # ── 새 error_class 5개의 action 계약 ─────────────────────────────────────────
 def test_stalled_aborts():
     d = classify("STALLED: 진행신호 없음")

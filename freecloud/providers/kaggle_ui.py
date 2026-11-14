@@ -413,6 +413,12 @@ class KaggleUIProvider(KaggleProvider):
                     why = _login_required(page, ctx)
                     if why:
                         return False, f"LOGIN_REQUIRED: {why} → fcc kaggle-login 후 재실행", None
+                    # 같은 페이지를 60초 더 기다려봐야 SPA 가 이미 멈춰 있으면 소용없다 —
+                    # reload 로 렌더를 다시 시도한다(Fable #6). reload 실패는 무시(아래 재대기).
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=60000)
+                    except Exception:
+                        pass
                     try:
                         page.wait_for_selector("text=Save Version", timeout=60000)
                     except PWTimeout as e2:
@@ -464,9 +470,11 @@ class KaggleUIProvider(KaggleProvider):
                     file_exp = _kaggleid_expiry(_json.load(f).get("cookies"))
             except Exception:
                 file_exp = None
+            diff = (f" (Δ{(live_exp - file_exp) / 3600:+.1f}h)"
+                    if (live_exp and file_exp) else "")
             print(f"[kaggle-ui] 쿠키 만료 측정: 파일="
                   f"{_fmt_day(file_exp) if file_exp else '?'} / 라이브="
-                  f"{_fmt_day(live_exp) if live_exp else '?'}", flush=True)
+                  f"{_fmt_day(live_exp) if live_exp else '?'}{diff}", flush=True)
             try:
                 paths.ensure_user_home()
                 with open(paths.user_file("kaggle_cookie_probe.jsonl"),
@@ -906,19 +914,11 @@ def save_login_state(headful: bool = True, timeout_s: int = 300) -> str:
                         raise       # 닫힌 건 '일시적 실패'가 아니다 — 폴링해봐야 헛돈다
                     pass  # 페이지 전환 중 일시적 실패는 무시하고 계속 폴링
 
-            # ok 무관하게 storage_state 는 호출한다(세션 캡처 시도). 다만 **파일 교체는 로그인
-            # 성공일 때만**(#10b·c) — 실패 시 이전(유효) 세션을 익명 세션으로 덮지 않는다.
+            # 파일은 **로그인 성공일 때만** 원자적으로 저장한다(#10b·c) — 실패 시 아무것도 쓰지
+            # 않아 이전(유효) 세션을 익명 세션으로 덮지 않고, 익명 쿠키를 디스크에 남기지도 않는다
+            # (Fable #5: 쓸모없던 .rejected throwaway 제거 — 요구 테스트 없고 부작용만 늘렸다).
             if ok:
                 _save_state_atomic(ctx, _state_path())
-            else:
-                rejected = _state_path() + ".rejected"
-                try:
-                    ctx.storage_state(path=rejected)
-                finally:
-                    try:
-                        os.remove(rejected)
-                    except OSError:
-                        pass
             ctx.close()
         except Exception as e:
             if _is_browser_closed(e):
