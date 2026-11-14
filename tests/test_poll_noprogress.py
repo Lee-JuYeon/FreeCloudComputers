@@ -64,6 +64,22 @@ def test_no_first_progress_stalls_after_grace(monkeypatch):
     assert len(stops) == 1
 
 
+# ── 1b) Fable #1: 재개 시나리오 — 옛 커밋이 한도를 부풀리면 안 된다 ──────────
+def test_old_commit_does_not_inflate_limit(monkeypatch):
+    # repo 에 3일 전 옛 커밋 + 이번 run 의 첫 커밋(20분)뒤 정지 → 약 66분에 STALLED.
+    # 버그(옛 커밋을 간격에 넣음)면 한도가 수천 분으로 부풀어 영영 미발동.
+    p, clock, stops = _prov(monkeypatch, lambda repo: None)
+    old = 1_000_000.0 - 3 * 86400          # 3일 전(이번 run 아님)
+    first_run_commit = 1_001_260.0          # running 시작(≈+60s) 뒤 20분
+
+    def commit(repo):
+        return ("step=1", first_run_commit) if clock["t"] >= first_run_commit else ("old", old)
+    monkeypatch.setattr(K, "latest_checkpoint_commit", commit)
+    res = p._poll_and_fetch(_job(max_runtime_s=5000), work="/u")
+    assert res.error_class == "STALLED" and len(stops) == 1
+    assert "한도 40분" in res.reason          # 적응 한도=max(40분, 2×20분)=40분(부풀지 않음)
+
+
 # ── 2) 44분(grace 미만) → 미발동 ─────────────────────────────────────────────
 def test_under_grace_does_not_stall(monkeypatch):
     commit = lambda repo: ("step=0", 990_000.0)
@@ -104,8 +120,10 @@ def test_hf_none_never_stalls(monkeypatch):
 # ── 6) queued 동안은 시계가 안 간다(grace 는 첫 running 부터) ────────────────
 def test_queued_time_does_not_count(monkeypatch):
     # 50분 queued → running. poll_start 부터 세면 즉시 stall 이지만, 첫 running 부터 세야 한다.
+    # HF 는 **옛 커밋**을 돌려줘 grace 경로를 실제로 태운다(None 이면 strike 리셋으로 빠져 못 봄).
     status_fn = lambda t: "RUNNING" if t >= 1_003_000 else "QUEUED"
-    p, _, stops = _prov(monkeypatch, lambda repo: None, status_fn=status_fn)
+    old_commit = lambda repo: ("old", 1_000_000.0 - 86400)   # 하루 전(이번 run 아님)
+    p, _, stops = _prov(monkeypatch, old_commit, status_fn=status_fn)
     # running 시작(≈1_003_060) 뒤 15분만 돌고 종료 → grace(45분) 안쪽 → 미발동.
     res = p._poll_and_fetch(_job(max_runtime_s=4000), work="/u")
     assert res.error_class != "STALLED" and stops == []

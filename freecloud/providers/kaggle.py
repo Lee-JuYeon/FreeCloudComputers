@@ -136,18 +136,22 @@ class _NoProgressWatchdog:
             return False
         title, created = commit
         self.last_title = title
-        if created > self.last_commit_epoch:      # 새 커밋 관측 → 간격 갱신
+        # ★Fable #1: **이번 run 의 커밋만** 간격·기준에 넣는다. 이전 run 의 옛 커밋(created ≤
+        #   poll_start−120)을 끌어들이면 간격이 '며칠'로 부풀어(재개 시나리오) 한도가 그 2배가
+        #   돼 워치독이 무력화된다. 옛 커밋은 last_commit_epoch·max_interval 에 넣지 않는다.
+        this_run = created > (self.poll_start - 120)
+        if this_run and created > self.last_commit_epoch:   # 이번 run 의 새 커밋 관측
+            # 간격의 기준은 '이번 run 에서 관측한 직전 커밋'뿐 — 없으면 running 시작 시각.
             prev = self.last_commit_epoch if self.last_commit_epoch > 0 else self.first_running_ts
             if prev is not None:
                 interval = created - prev
                 if interval > self.max_interval:
                     self.max_interval = interval
             self.last_commit_epoch = created
-        this_run = created > (self.poll_start - 120)
-        if this_run:
-            baseline = created
+        if self.last_commit_epoch > 0:            # 이번 run 에서 커밋을 본 적 있음
+            baseline = self.last_commit_epoch
             limit = max(self.floor, NOPROGRESS_ADAPT * self.max_interval)
-        else:
+        else:                                     # 이번 run 커밋 아직 없음(옛 커밋만/없음) → grace
             baseline = self.first_running_ts if self.first_running_ts is not None else self.poll_start
             limit = self.grace
         elapsed = now - baseline
@@ -715,8 +719,8 @@ class KaggleProvider(Provider):
                         f"STALLED: {wd.stall_minutes}분째 진행신호 없음(한도 {wd.limit_minutes}분, "
                         f"마지막={wd.last_title or '(없음)'}). 커널 중지 "
                         f"{'완료' if stopped else '실패'}: {swhy}. 원인 후보: (1) 학습 데드락/행 "
-                        f"(2) HF 업로드 실패로 커밋 안 됨 (3) OOM 후 좀비 (4) 데이터로더 정지. "
-                        f"`fcc logs {job.name}` 로 확인.",
+                        f"(2) HF 업로드 실패로 커밋 안 됨(저장용량 초과 403·토큰 401) "
+                        f"(3) OOM 후 좀비 (4) 데이터로더 정지. `fcc logs {job.name}` 로 확인.",
                         (st or "")[-400:], "STALLED", pushed=True, remote_alive=not stopped)
             # ── 상태조회가 연속 POLL_BLIND_MAX 회 실패 → 생사 판정 불가(#1) ──────────
             if blind >= POLL_BLIND_MAX:
