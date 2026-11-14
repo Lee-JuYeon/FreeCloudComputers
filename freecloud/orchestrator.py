@@ -160,6 +160,13 @@ def run(job: Job, once: bool = False, max_rounds: int = 3) -> dict:
                 print(f"⏳ [detached] 커널 계속 실행 중 — {res.reason}", flush=True)
                 return dict(ok=False, detached=True, provider=name,
                             reason=f"[detached] {res.reason}", attempts=attempts)
+            if res.remote_alive:
+                # 원격 커널/세션이 아직 살아 있을 수 있다(KERNEL_BUSY·POLL_BLIND·stop 실패 STALLED
+                # 등). 쿨다운·재시도·페일오버 없이 즉시 멈춘다 — 다른 provider 를 띄우면 이중 세션이
+                # 된다(detached 와 같은 원칙). ABORT 분류보다 **먼저** 걸러 보호한다.
+                print(f"🛑 [remote_alive] 원격 세션 생존 가능 — 멈춤: {res.reason}", flush=True)
+                return dict(ok=False, provider=name, remote_alive=True,
+                            reason=f"[remote_alive] {res.reason}", attempts=attempts)
             if d.action == ABORT:
                 return dict(ok=False, provider=None,
                             reason=f"[{name}] job 결함으로 중단: {d.advice}", attempts=attempts)
@@ -184,7 +191,7 @@ def run(job: Job, once: bool = False, max_rounds: int = 3) -> dict:
 def _run_with_retry(prov: Provider, job: Job) -> "":
     """RETRY 분류면 같은 provider로 1회 더. detached 는 재시도하지 않는다(살아 있는 런)."""
     res = prov.run(job)
-    if res.ok or res.status == "detached":
+    if res.ok or res.status == "detached" or res.remote_alive:
         return res
     d = classify(res.error_class + " " + res.reason + " " + res.log_tail)
     if d.action == RETRY:

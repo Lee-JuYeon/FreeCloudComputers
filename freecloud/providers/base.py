@@ -50,6 +50,14 @@ class RunResult:
     # RunResult(False,"error","reason","log","CLASS") 처럼 위치인자로 만들기 때문에
     # 중간에 끼우면 조용히 어긋난다(불변조건 5, docs/IMPROVEMENTS_2026-09-23.md §2).
     artifacts_dir: str = ""
+    # ── #4 가드 밑바탕(2026-11-14) ──────────────────────────────────────────
+    # 둘 다 **맨 뒤**에 기본값과 함께 둔다(위치인자 호환, 불변조건 5).
+    #   pushed:       push 가 성공해 원격에 코드가 올라갔는가(push 뒤 결과는 전부 True).
+    #   remote_alive: 원격 커널/세션이 **아직 살아 있을 수 있다**(KERNEL_BUSY·POLL_BLIND·
+    #                 stop 실패한 STALLED 등). 오케스트레이터는 이 값이 True 면 쿨다운·재시도·
+    #                 페일오버 없이 즉시 멈춘다(이중 세션 방지 — detached 와 같은 원칙).
+    pushed: bool = False
+    remote_alive: bool = False
 
 
 class Provider(ABC):

@@ -40,6 +40,39 @@ _PLAYBOOK: list[tuple[str, str, str, str, int]] = [
      "DETACHED", DETACH, "폴링 상한 초과 — 원격 커널은 계속 실행 중. 산출물은 "
      "checkpoint_repo 에서 회수. 다른 provider 를 띄우면 이중 학습이 된다.", 0),
 
+    # ── #4 무간섭 가드(2026-11-14): DETACHED **바로 아래**(순서가 계약) ───────────
+    # 이 다섯은 '원격 커널이 살아 있거나(remote_alive), 페일오버로는 못 고치는' 상황이다.
+    # DETACHED 다음·쿼터/인증/TRANSIENT **위**에 둬야, 새 reason 안의 '403'·'timeout' 같은
+    # 낱말이 AUTH/TRANSIENT 로 새지 않는다. (새 reason 문구에 'detached' 낱말을 쓰지 않는다 —
+    # 맨 위 DETACHED 에 먼저 걸리기 때문.)
+    #
+    # 무진행 워치독(A): 진행신호가 끊긴 커널을 stop 한 뒤 알린다. 코드/데이터 결함이라
+    # 다른 provider 로 가도 같은 자리에서 멈춘다 → ABORT(쿨다운 0). stop 성공 시 remote_alive
+    # =False 라 그대로 ABORT, stop 실패면 remote_alive=True 로 오케스트레이터가 멈춘다.
+    (r"\bstalled\b",
+     "STALLED", ABORT, "진행신호가 끊긴 커널을 중지했다 — 학습 데드락/HF 업로드 실패/OOM 좀비/"
+     "데이터로더 정지 중 하나. 로그로 원인을 확인하라: `fcc logs <job>`. 멈추지 못했으면 "
+     "`fcc kaggle-stop <user/slug>`.", 0),
+    # push 앞 관문(#8): 같은 커널이 이미 running/queued 면 push 하면 세션이 둘이 된다.
+    # 페일오버/재시도 금지 → ABORT. remote_alive=True 로 이미 돌던 세션을 보호한다.
+    (r"kernel_busy",
+     "KERNEL_BUSY", ABORT, "같은 커널이 이미 실행(또는 대기) 중 — push 하면 이중 세션이 된다. "
+     "이미 돌던 세션을 쓰거나, 멈추려면 `fcc kaggle-stop <user/slug>`.", 0),
+    # 폴링 진실(#1): 상태조회가 연속 실패해 생사 판정 불가. 원격은 살아 있을 수 있으니
+    # 페일오버하지 않는다 → ABORT + remote_alive(제공자가 세팅). 사람이 로그로 확인.
+    (r"poll_blind",
+     "POLL_BLIND", ABORT, "커널 상태조회가 연속 실패해 생사 판정 불가 — 원격은 계속 돌 수 있다. "
+     "다른 provider 를 띄우지 말고 로그로 확인하라: `fcc logs <job>`.", 0),
+    # 취소 확인(cancel_acknowledged): 커널이 취소됐다 → 재시도/페일오버 무의미, ABORT.
+    (r"\bcancelled\b",
+     "CANCELLED", ABORT, "커널이 취소됨(cancel_acknowledged). 재실행하려면 원인 확인 후 "
+     "`fcc logs <job>`.", 0),
+    # UI 자동화 실패(preflight/commit): 브라우저 DOM 변경 등 — 다른 provider 로 넘어간다.
+    # (예전엔 reason 의 'timeout' 이 TRANSIENT 로 새 같은 provider 를 재시도했다, 설계 §C1.)
+    (r"ui_automation",
+     "UI_AUTOMATION", FAILOVER, "브라우저 UI 자동화 실패(셀렉터/DOM 변경 가능). 다음 provider 로 "
+     "넘어간다. 반복되면 `FREECLOUD_KAGGLE_HEADFUL=1` 로 눈으로 확인.", 900),
+
     # ── 쿼터/가용성: 다른 provider로 페일오버 ────────────────────────────────
     (r"too\s*many\s*assignments|service unavailable|503|no backend|"
      r"cannot connect to gpu|usage limit|quota (?:exceeded|exhausted)|"
