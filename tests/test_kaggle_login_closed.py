@@ -9,6 +9,7 @@ sys.modules 에 가짜 모듈을 심는다(실제 브라우저는 절대 뜨지 
 """
 from __future__ import annotations
 
+import json
 import sys
 import types
 
@@ -54,7 +55,15 @@ class _FakeCtx:
         return [] if self.anon else [{"name": "CLIENT-TOKEN", "value": 'h.eyJhbm9uIjogZmFsc2V9.s'}]
 
     def storage_state(self, path=None):
+        # 실제 파일을 쓴다(#13 원자 저장이 tmp→replace 를 하므로 진짜 파일이 있어야 한다).
         self.saved = True
+        if path:
+            try:
+                cks = self.cookies()
+            except Exception:
+                cks = []
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"cookies": cks}, f)
 
     def close(self):
         return None

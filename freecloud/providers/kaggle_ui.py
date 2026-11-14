@@ -421,6 +421,12 @@ class KaggleUIProvider(KaggleProvider):
                             return (False, f"LOGIN_REQUIRED: {why} → fcc kaggle-login 후 재실행",
                                     None)
                         return False, f"셀렉터 타임아웃(UI 변경 가능): {e2}", None
+                # (b) 쿠키 연장 측정 — 에디터 렌더 성공 직후. 측정/저장 예외는 삼켜 preflight
+                #     결과를 바꾸지 않는다(한 겹 더 감싼다 — _measure 가 스스로 삼키지만 방어).
+                try:
+                    self._measure_cookie_extension(ctx)
+                except Exception:
+                    pass
                 # 에디터 렌더 성공 — 쿼터 소진검사(소진이면 push 가 세션을 못 띄운다).
                 exhausted, qdetail = self._quota_exhausted(self._page_text(page))
                 if exhausted:
@@ -441,6 +447,40 @@ class KaggleUIProvider(KaggleProvider):
             finally:
                 ctx.close()
                 browser.close()
+
+    def _measure_cookie_extension(self, ctx) -> None:
+        """라이브 __Host-KAGGLEID 만료 vs 저장 파일값을 한 줄 로그·probe 파일로 남긴다(#10b).
+
+        Kaggle 이 세션 중 쿠키 수명을 연장해 주면, 라이브가 파일보다 1h 넘게 늦고 anon 이 아닐
+        때만 세션을 되저장해 14일 만료를 미룬다. **측정·저장 모든 예외를 삼킨다** — run 을 막지
+        않는다(관측용 부가기능). probe 파일은 수명 패턴 분석용(ts,file_exp,live_exp)."""
+        try:
+            import json as _json
+            import time as _time
+            live_exp = _kaggleid_expiry(ctx.cookies())
+            file_exp = None
+            try:
+                with open(_state_path(), encoding="utf-8") as f:
+                    file_exp = _kaggleid_expiry(_json.load(f).get("cookies"))
+            except Exception:
+                file_exp = None
+            print(f"[kaggle-ui] 쿠키 만료 측정: 파일="
+                  f"{_fmt_day(file_exp) if file_exp else '?'} / 라이브="
+                  f"{_fmt_day(live_exp) if live_exp else '?'}", flush=True)
+            try:
+                paths.ensure_user_home()
+                with open(paths.user_file("kaggle_cookie_probe.jsonl"),
+                          "a", encoding="utf-8") as f:
+                    f.write(_json.dumps({"ts": _time.time(), "file_exp": file_exp,
+                                         "live_exp": live_exp}) + "\n")
+            except Exception:
+                pass
+            if (live_exp and file_exp and live_exp > file_exp + 3600
+                    and _cookie_says_anon(ctx.cookies()) is False):
+                _save_state_atomic(ctx, _state_path())
+                print("[kaggle-ui] 쿠키 연장 관측(라이브 > 파일+1h) → 세션 되저장", flush=True)
+        except Exception:
+            pass
 
     # ── Playwright 자동화 ────────────────────────────────────────────────────
     def _set_t4x2_and_commit(self, job: Job) -> tuple[bool, str]:
@@ -783,6 +823,22 @@ def stop_running_session(user: str, slug: str,
                 browser.close()
 
 
+def _save_state_atomic(ctx, path: str) -> None:
+    """storage_state 를 원자적으로 저장: tmp 에 쓰고 → chmod 0600 → os.replace(#13).
+
+    원자성이 필요한 이유: 저장 중 죽으면 반쪽 JSON 이 남아 로그인이 통째로 날아간다
+    (credentials.json 과 같은 원칙). chmod 는 Windows 등에서 실패해도 무시(원본 CLI 와 동일).
+    예외는 올린다 — 호출부(save_login_state 등)가 '저장 실패'로 처리한다."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    ctx.storage_state(path=tmp)
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+
+
 def save_login_state(headful: bool = True, timeout_s: int = 300) -> str:
     """`fcc kaggle-login` 구현 — 브라우저 띄워 사용자가 직접 로그인하면 상태 저장.
 
@@ -850,7 +906,19 @@ def save_login_state(headful: bool = True, timeout_s: int = 300) -> str:
                         raise       # 닫힌 건 '일시적 실패'가 아니다 — 폴링해봐야 헛돈다
                     pass  # 페이지 전환 중 일시적 실패는 무시하고 계속 폴링
 
-            ctx.storage_state(path=_state_path())
+            # ok 무관하게 storage_state 는 호출한다(세션 캡처 시도). 다만 **파일 교체는 로그인
+            # 성공일 때만**(#10b·c) — 실패 시 이전(유효) 세션을 익명 세션으로 덮지 않는다.
+            if ok:
+                _save_state_atomic(ctx, _state_path())
+            else:
+                rejected = _state_path() + ".rejected"
+                try:
+                    ctx.storage_state(path=rejected)
+                finally:
+                    try:
+                        os.remove(rejected)
+                    except OSError:
+                        pass
             ctx.close()
         except Exception as e:
             if _is_browser_closed(e):
@@ -866,8 +934,14 @@ def save_login_state(headful: bool = True, timeout_s: int = 300) -> str:
             _state.clear_cooldown("kaggle-ui")
         except Exception:
             pass
-        print(f"[OK] 로그인 확인 + 상태 저장됨 -> {_state_path()}")
+        detail = ""
+        try:
+            detail = browser_login_status(_state_path()).detail
+        except Exception:
+            detail = ""
+        tail = f" · {detail}" if detail else ""
+        print(f"[OK] 로그인 확인 + 상태 저장됨 -> {_state_path()}{tail}")
     else:
-        print(f"[FAIL] {timeout_s}초 내 로그인 감지 실패 - 저장은 했지만 미로그인 상태일 수 있음 "
+        print(f"[FAIL] {timeout_s}초 내 로그인 감지 실패 - 저장하지 않고 기존 저장 상태 유지 "
               f"({_state_path()}). 'fcc providers'로 확인하세요.")
     return _state_path()
