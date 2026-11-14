@@ -466,12 +466,29 @@ class KaggleProvider(Provider):
                           f"push 가 새 세션을 못 띄웠다(쿼터 소진 추정). 다음 provider 로 페일오버.")
         return False, ""
 
-    def _push(self, work: str, job: Job) -> tuple[int, str]:
+    def _busy_check(self, job: Job, before: "tuple[str, str] | None" = None) -> "RunResult | None":
+        """push 앞 관문(#8): 같은 커널이 이미 running/queued 면 push 하면 세션이 둘이 된다.
+
+        _kernel_run_signature 의 상태어가 running/queued 면 KERNEL_BUSY(remote_alive=True)로
+        막는다 — 못 읽으면('') 통과(거짓 양성 금지, 처음 돌리는 커널 등). before 를 주면 재조회
+        없이 그 지문을 재사용한다(run() 이 _push 와 공유)."""
+        kid = self.kernel_id(job)
+        sig = before if before is not None else self._kernel_run_signature(kid)
+        if sig[1] in ("running", "queued"):
+            return RunResult(False, "error",
+                             f"KERNEL_BUSY: kernel={kid} status={sig[1]} — push 하면 이중 세션",
+                             "", "KERNEL_BUSY", remote_alive=True)
+        return None
+
+    def _push(self, work: str, job: Job,
+              before: "tuple[str, str] | None" = None) -> tuple[int, str]:
         env = {**_UTF8, **job.resolved_env()}
         kid = self.kernel_id(job)
         # push 전 지문을 찍어두고(쿼터 소진이면 push 가 rc=0 이어도 새 세션을 안 띄움),
         # push 후 변화가 없으면 STALE_KERNEL 로 실패시켜 옛 COMPLETE 를 성공으로 읽는 걸 막는다.
-        before = self._kernel_run_signature(kid)
+        # before 를 받으면(busy_check 가 이미 찍은 것) 재조회 없이 재사용한다.
+        if before is None:
+            before = self._kernel_run_signature(kid)
         rc, log = self._sh(["kaggle", "kernels", "push", "-p", work], 300, env)
         if rc != 0:
             return rc, log
@@ -742,14 +759,21 @@ class KaggleProvider(Provider):
     def run(self, job: Job) -> RunResult:
         if not self._user():
             return RunResult(False, "error", "Kaggle 인증 없음.", error_class="AUTH")
+        # #8 push 앞 관문: 지문 1회로 busy 판정 + _push 의 stale 기준선을 공유한다.
+        sig = self._kernel_run_signature(self.kernel_id(job))
+        busy = self._busy_check(job, before=sig)
+        if busy is not None:
+            return busy
         work, err = self._stage_and_write(job)
         if err is not None:
             return err
-        rc, log = self._push(work, job)
+        rc, log = self._push(work, job, before=sig)
         if rc != 0:
             d = classify(log)
             return RunResult(False, "error", d.advice, log[-1200:], d.error_class)
-        return self._poll_and_fetch(job, work)
+        res = self._poll_and_fetch(job, work)
+        res.pushed = True          # push 성공 뒤 결과는 전부 pushed=True
+        return res
 
 
 

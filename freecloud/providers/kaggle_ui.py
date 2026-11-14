@@ -302,44 +302,145 @@ class KaggleUIProvider(KaggleProvider):
     def run(self, job: Job) -> RunResult:
         if self._pw() is None:
             return RunResult(False, "error", "playwright 미설치.", error_class="JOB_CONFIG")
-        # L0 파일검사(비용 0, push·업로드 前). 만료/부재면 LOGIN_REQUIRED(ABORT) 로 즉시 끝낸다 —
-        # 쿠키 파일은 provider 공통이라 페일오버해도 똑같이 막힌다(설계 §3). session_is_logged_in 이
-        # 쿠키 만료(14일)까지 본다(browser_login_status 를 감싼 것 — 호출부 무변경).
+        # L0 파일검사(비용 0, push·업로드·브라우저 前). 만료/부재면 LOGIN_REQUIRED(ABORT) 로 즉시
+        # 끝낸다 — 쿠키 파일은 provider 공통이라 페일오버해도 똑같이 막힌다(설계 §3).
         ok, detail = session_is_logged_in(_state_path())
         if not ok:
             return RunResult(False, "needs_setup", detail, error_class="LOGIN_REQUIRED")
+        # #8 push 앞 관문: 지문 1회로 busy 판정 + kernel_exists + _push stale 기준선을 공유한다.
+        sig = self._kernel_run_signature(self.kernel_id(job))
+        busy = self._busy_check(job, before=sig)
+        if busy is not None:
+            return busy
+        kernel_exists = bool(sig[0] or sig[1])
+        # 브라우저 프리플라이트(L0 다음·push 앞): 로그인/쿼터/가속기를 미리 확인한다. 실패면
+        # 업로드·push 쿼터를 태우기 전에 끝낸다(#8+#2+D).
+        pf_ok, pf_why, accel = self._browser_preflight(job, kernel_exists)
+        if not pf_ok:
+            if pf_why.startswith("LOGIN_REQUIRED"):
+                return RunResult(False, "needs_setup", f"브라우저 로그인 만료/부재: {pf_why}",
+                                 error_class="LOGIN_REQUIRED")
+            if pf_why.startswith("QUOTA_COOLDOWN"):
+                return RunResult(False, "quota", f"GPU 쿼터 소진: {pf_why}",
+                                 error_class="QUOTA_COOLDOWN")
+            return RunResult(False, "needs_setup", f"UI 자동화 실패(preflight): {pf_why}",
+                             error_class="UI_AUTOMATION")
         # 1) 코드 push(커널 등록) — workdir 업로드·dataset_sources 배선은 부모 헬퍼가
         #    한다(설계 §3: kaggle-ui 는 재사용만으로 결함 A 가 자동 적용돼야 한다).
         work, staged_err = self._stage_and_write(job)
         if staged_err is not None:
             return staged_err
-        rc, log = self._push(work, job)
+        rc, log = self._push(work, job, before=sig)
         if rc != 0:
             from ..errors import classify
             d = classify(log)
             return RunResult(False, "error", d.advice, log[-1000:], d.error_class)
-        # 2) UI로 T4×2 설정 + 커밋
-        ok, why = self._set_t4x2_and_commit(job)
-        if not ok:
-            # 쿼터 소진은 UI 자동화 실패가 아니라 provider 쿼터 문제 →
-            # QUOTA_COOLDOWN(status="quota")로 다음 provider 로 페일오버시킨다.
-            if why.startswith("QUOTA_COOLDOWN"):
-                return RunResult(False, "quota", f"GPU 쿼터 소진: {why}",
-                                 error_class="QUOTA_COOLDOWN")
-            # 라이브(L1/L2)에서 로그인 만료/부재가 드러나면 LOGIN_REQUIRED(ABORT). UI 변경과
-            # 분리된다 — 진짜 DOM 변경은 아래 UI_AUTOMATION 으로 그대로 드러난다(설계 §2.L2).
-            if why.startswith("LOGIN_REQUIRED"):
-                return RunResult(False, "needs_setup", f"브라우저 로그인 만료/부재: {why}",
-                                 error_class="LOGIN_REQUIRED")
-            return RunResult(False, "needs_setup", f"UI 자동화 실패: {why}",
-                             error_class="UI_AUTOMATION")
-        ui_commit = "skipped" if why.startswith("skipped") else "committed"
-        print(f"[kaggle-ui] ui_commit={ui_commit} ({why})", flush=True)
+        # 2) push 성공 → 이후 모든 결과는 pushed=True. preflight 가속기가 이미 T4x2 면
+        #    push 가 그 값으로 run 을 띄웠으니 브라우저 커밋 단계를 통째로 생략(중복 세션 방지).
+        if accel == T4X2_LABEL:
+            ui_commit = "skipped(preflight)"
+            print("[kaggle-ui] preflight 가속기=T4x2 — 브라우저 커밋 단계 생략", flush=True)
+        else:
+            ok2, why2 = self._set_t4x2_and_commit(job)
+            if not ok2:
+                # 쿼터 소진은 push(rc=0) 가 세션을 못 띄운 것 → 멈출 세션 없음, 페일오버만.
+                if why2.startswith("QUOTA_COOLDOWN"):
+                    return RunResult(False, "quota", f"GPU 쿼터 소진: {why2}",
+                                     error_class="QUOTA_COOLDOWN", pushed=True)
+                # push 는 이미 (이전 가속기로) 세션을 띄웠다 → 커밋 실패면 그 세션을 멈춘다
+                #  (쿼터 낭비 방지). 못 멈추면 remote_alive=True 로 오케스트레이터가 멈춘다.
+                stopped, swhy = self.stop_kernel(self.kernel_id(job))
+                print(f"[kaggle-ui] UI 커밋 실패 — push 된 세션 중지 "
+                      f"{'완료' if stopped else '실패'}: {swhy}", flush=True)
+                if why2.startswith("LOGIN_REQUIRED"):
+                    return RunResult(False, "needs_setup", f"브라우저 로그인 만료/부재: {why2}",
+                                     error_class="LOGIN_REQUIRED", pushed=True,
+                                     remote_alive=not stopped)
+                return RunResult(False, "needs_setup", f"UI 자동화 실패: {why2}",
+                                 error_class="UI_AUTOMATION", pushed=True,
+                                 remote_alive=not stopped)
+            ui_commit = "skipped" if why2.startswith("skipped") else "committed"
+            print(f"[kaggle-ui] ui_commit={ui_commit} ({why2})", flush=True)
         # 3) 폴링 + GPU 검증(부모 헬퍼 재사용)
         res = self._poll_and_fetch(job, work)
+        res.pushed = True
         # 어느 경로(생략/커밋)로 돌았는지 사람이 결과만 보고 알 수 있게 남긴다.
         res.reason = f"{res.reason} [ui_commit: {ui_commit}]"
         return res
+
+    # ── 브라우저 프리플라이트(#8+#2+D): push 앞에서 로그인/쿼터/가속기 확인 ──────────
+    def _browser_preflight(self, job: Job, kernel_exists: bool) -> tuple[bool, str, "str | None"]:
+        """push 전에 브라우저로 상태를 확인한다 → (ok, why, accelerator|None).
+
+        · 커널이 이미 있으면: 에디터를 열어 L1 로그인검사 → 'Save Version' 렌더 대기(타임아웃이면
+          L2 재판정 후 1회 재시도) → 쿼터 소진검사 → 현재 가속기 읽기(실패는 None·치명 아님).
+        · 커널이 없으면(첫 실행): 에디터가 아직 없어 404 를 로그인만료로 오판할 수 있으니, 대신
+          안정 페이지(/code)를 열어 쿠키가 **명시적으로 익명**일 때만 LOGIN_REQUIRED, 그 외 통과.
+        실패 why 접두사(run 이 매핑): LOGIN_REQUIRED / QUOTA_COOLDOWN / 그 외(UI_AUTOMATION).
+        """
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+        user = self._user()
+        slug = self.kernel_slug(job)
+        headful = os.environ.get("FREECLOUD_KAGGLE_HEADFUL") == "1"
+
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=not headful)
+            ctx = browser.new_context(storage_state=_state_path())
+            page = ctx.new_page()
+            try:
+                if not kernel_exists:
+                    # 첫 실행: 에디터 404 를 로그인 만료로 오판하지 않도록 안정 페이지로 본다.
+                    page.goto("https://www.kaggle.com/code",
+                              wait_until="domcontentloaded", timeout=60000)
+                    try:
+                        anon = _cookie_says_anon(ctx.cookies())
+                    except Exception:
+                        anon = None
+                    if anon is True:
+                        return (False, "LOGIN_REQUIRED: 익명 세션 쿠키(로그인 만료) → "
+                                "fcc kaggle-login 후 재실행", None)
+                    return True, "preflight ok(첫 실행 — 로그인 확인)", None
+
+                url = f"https://www.kaggle.com/code/{user}/{slug}/edit"
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                why = _login_required(page, ctx)
+                if why:
+                    return False, f"LOGIN_REQUIRED: {why} → fcc kaggle-login 후 재실행", None
+                try:
+                    page.wait_for_selector("text=Save Version", timeout=60000)
+                except PWTimeout as e:
+                    # L2: 타임아웃이 사실 로그인 만료인지 재판정, 아니면 1회 재시도.
+                    why = _login_required(page, ctx)
+                    if why:
+                        return False, f"LOGIN_REQUIRED: {why} → fcc kaggle-login 후 재실행", None
+                    try:
+                        page.wait_for_selector("text=Save Version", timeout=60000)
+                    except PWTimeout as e2:
+                        why = _login_required(page, ctx)
+                        if why:
+                            return (False, f"LOGIN_REQUIRED: {why} → fcc kaggle-login 후 재실행",
+                                    None)
+                        return False, f"셀렉터 타임아웃(UI 변경 가능): {e2}", None
+                # 에디터 렌더 성공 — 쿼터 소진검사(소진이면 push 가 세션을 못 띄운다).
+                exhausted, qdetail = self._quota_exhausted(self._page_text(page))
+                if exhausted:
+                    return False, f"QUOTA_COOLDOWN: {qdetail}", None
+                # 현재 저장된 가속기 읽기(실패는 None — 치명 아님, run 이 _set_t4x2 로 처리).
+                try:
+                    accel = self._read_accelerator(page)
+                except Exception:
+                    accel = None
+                return True, "preflight ok", accel
+            except PWTimeout as e:
+                why = _login_required(page, ctx)
+                if why:
+                    return False, f"LOGIN_REQUIRED: {why} → fcc kaggle-login 후 재실행", None
+                return False, f"셀렉터 타임아웃(UI 변경 가능): {e}", None
+            except Exception as e:
+                return False, f"{type(e).__name__}: {e}", None
+            finally:
+                ctx.close()
+                browser.close()
 
     # ── Playwright 자동화 ────────────────────────────────────────────────────
     def _set_t4x2_and_commit(self, job: Job) -> tuple[bool, str]:

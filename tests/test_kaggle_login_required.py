@@ -184,8 +184,12 @@ def test_t11_timeout_without_login_stays_ui_automation(monkeypatch):
     # run 매핑: 로그인 아닌 타임아웃은 UI_AUTOMATION 으로 남는다(분리 검증).
     monkeypatch.setattr(p, "_pw", lambda: object())
     monkeypatch.setattr(UI, "session_is_logged_in", lambda path=None: (True, "ok"))
+    # #4 push 앞 관문 스텁(가드 약화 아님 — 기존 매핑 경로만 검증).
+    monkeypatch.setattr(p, "_kernel_run_signature", lambda kid: ("", ""))
+    monkeypatch.setattr(p, "_browser_preflight", lambda job, ke: (True, "ok", None))
+    monkeypatch.setattr(p, "stop_kernel", lambda kid: (True, "stopped"))
     monkeypatch.setattr(p, "_stage_and_write", lambda job: ("work", None))
-    monkeypatch.setattr(p, "_push", lambda work, job: (0, "pushed"))
+    monkeypatch.setattr(p, "_push", lambda work, job, before=None: (0, "pushed"))
     monkeypatch.setattr(p, "_set_t4x2_and_commit", lambda job: (False, why))
     res = p.run(_job())
     assert res.ok is False and res.error_class == "UI_AUTOMATION"
@@ -209,8 +213,11 @@ def test_t13_valid_session_reaches_poll(monkeypatch):
     p = _prov()
     monkeypatch.setattr(p, "_pw", lambda: object())
     monkeypatch.setattr(UI, "session_is_logged_in", lambda path=None: (True, "ok"))
+    monkeypatch.setattr(p, "_kernel_run_signature", lambda kid: ("", ""))
+    monkeypatch.setattr(p, "_browser_preflight", lambda job, ke: (True, "ok", None))
+    monkeypatch.setattr(p, "stop_kernel", lambda kid: (True, "stopped"))
     monkeypatch.setattr(p, "_stage_and_write", lambda job: ("work", None))
-    monkeypatch.setattr(p, "_push", lambda work, job: (0, "pushed"))
+    monkeypatch.setattr(p, "_push", lambda work, job, before=None: (0, "pushed"))
     monkeypatch.setattr(p, "_set_t4x2_and_commit", lambda job: (True, "skipped: already T4x2"))
     reached = {}
 

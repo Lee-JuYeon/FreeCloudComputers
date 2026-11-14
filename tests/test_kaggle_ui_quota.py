@@ -84,12 +84,20 @@ def test_commit_on_page_proceeds_when_quota_ok():
 
 
 # ── run(): QUOTA_COOLDOWN why → status='quota', error_class='QUOTA_COOLDOWN' ──
+def _stub_guards(monkeypatch, p):
+    """#4 push 앞 관문(지문/busy/preflight/stop)을 막아 기존 run() 경로만 검증한다(가드 약화 아님)."""
+    monkeypatch.setattr(p, "_kernel_run_signature", lambda kid: ("", ""))
+    monkeypatch.setattr(p, "_browser_preflight", lambda job, ke: (True, "ok", None))
+    monkeypatch.setattr(p, "stop_kernel", lambda kid: (True, "stopped"))
+
+
 def test_run_maps_quota_cooldown(monkeypatch):
     p = _prov()
     monkeypatch.setattr(p, "_pw", lambda: object())
     monkeypatch.setattr(UI, "session_is_logged_in", lambda path=None: (True, "ok"))
+    _stub_guards(monkeypatch, p)
     monkeypatch.setattr(p, "_stage_and_write", lambda job: ("work", None))
-    monkeypatch.setattr(p, "_push", lambda work, job: (0, "pushed"))
+    monkeypatch.setattr(p, "_push", lambda work, job, before=None: (0, "pushed"))
     monkeypatch.setattr(p, "_set_t4x2_and_commit",
                         lambda job: (False, "QUOTA_COOLDOWN: GPU 쿼터 소진(31.63h ≥ 30h)"))
     res = p.run(Job(name="q", entrypoint="x", max_runtime_s=60))
@@ -104,8 +112,9 @@ def test_run_non_quota_ui_failure_stays_ui_automation(monkeypatch):
     p = _prov()
     monkeypatch.setattr(p, "_pw", lambda: object())
     monkeypatch.setattr(UI, "session_is_logged_in", lambda path=None: (True, "ok"))
+    _stub_guards(monkeypatch, p)
     monkeypatch.setattr(p, "_stage_and_write", lambda job: ("work", None))
-    monkeypatch.setattr(p, "_push", lambda work, job: (0, "pushed"))
+    monkeypatch.setattr(p, "_push", lambda work, job, before=None: (0, "pushed"))
     monkeypatch.setattr(p, "_set_t4x2_and_commit", lambda job: (False, "셀렉터 타임아웃"))
     res = p.run(Job(name="q", entrypoint="x", max_runtime_s=60))
     assert res.ok is False and res.error_class == "UI_AUTOMATION"

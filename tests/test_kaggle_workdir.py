@@ -49,6 +49,9 @@ def _provider(monkeypatch, calls, rcmap=None):
     """_sh 를 가로채 (cmd 기록, 정해둔 rc/출력) 만 돌려주는 provider."""
     p = KaggleProvider()
     monkeypatch.setattr(p, "_user", lambda: "someone")
+    # #8 push 앞 관문의 지문 조회가 CLI 를 때리지 않게 막는다(이 테스트들은 staging 만 본다).
+    # 빈 지문 = '처음 돌리는 커널' → busy_check 통과. 가드 자체는 test_kaggle_busy_guard 가 검증.
+    monkeypatch.setattr(p, "_kernel_run_signature", lambda kid: ("", ""))
 
     def fake_sh(cmd, timeout, env=None, cwd=None):
         calls.append(list(cmd))
