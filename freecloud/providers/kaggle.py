@@ -49,6 +49,109 @@ HEARTBEAT_S = 600
 #: 이 문자열이 status 에 있으면 커널이 아직 살아 있다(완료/오류 전).
 _ALIVE_MARKERS = ("running", "queued")
 
+# ── 무진행 워치독(A, 2026-11-14) ─────────────────────────────────────────────
+# 'running' 인데 HF checkpoint 가 오래 갱신 안 되면(진행신호 없음) 좀비/데드락이다 —
+# 쿼터만 태운다. checkpoint_repo 가 있을 때만(결과를 받을 곳이 있을 때만) 켜고, env 로 끈다.
+#   FIRST_PROGRESS_GRACE_S : 첫 커밋이 나올 때까지 봐주는 시간(env FCC_FIRST_PROGRESS_MIN 분).
+#   NOPROGRESS_S           : 커밋 사이 무진행 허용 바닥값(env FCC_NOPROGRESS_MIN 분).
+#   NOPROGRESS_ADAPT       : 관측된 최대 커밋간격의 이 배수까지는 기다린다(느린 job 적응).
+#   WATCHDOG_CHECK_S       : 워치독 점검 주기(running 폴에서만).
+#   STALL_CONFIRM          : 한도 초과를 이만큼 **연속** 확인해야 발동(일시 지연 흡수).
+FIRST_PROGRESS_GRACE_S = 2700
+NOPROGRESS_S = 2400
+NOPROGRESS_ADAPT = 2.0
+WATCHDOG_CHECK_S = 300
+STALL_CONFIRM = 2
+
+
+def _env_seconds(name: str, default_s: float) -> float:
+    """env `<name>`(분) → 초. 미설정/파싱실패는 기본값(초). 음수/0 은 그대로(비활성 신호)."""
+    v = os.environ.get(name)
+    if v is None:
+        return float(default_s)
+    try:
+        return float(v) * 60.0
+    except (TypeError, ValueError):
+        return float(default_s)
+
+
+def _watchdog_grace_s() -> float:
+    return _env_seconds("FCC_FIRST_PROGRESS_MIN", FIRST_PROGRESS_GRACE_S)
+
+
+def _watchdog_noprogress_s() -> float:
+    return _env_seconds("FCC_NOPROGRESS_MIN", NOPROGRESS_S)
+
+
+class _NoProgressWatchdog:
+    """HF checkpoint 진행신호로 '좀비 running' 을 잡는다(A). 상태는 폴링 루프가 들고 있다.
+
+    비활성 조건: checkpoint_repo 없음, 또는 grace/noprogress 중 하나라도 ≤0(env 로 끔).
+    판정(running 폴에서만, WATCHDOG_CHECK_S 마다):
+      · 이번 run 커밋(created > 폴시작−120s) 없음 → 기준=처음 running 본 시각, 한도=grace.
+      · 있음 → 기준=최신 커밋 시각, 한도=max(noprogress, ADAPT×관측 최대 커밋간격)
+               (간격엔 'running 시작→첫 커밋' 도 포함 — 느린 job 이 억울하게 안 죽게).
+      · HF 조회 실패(None)=모름 → strike 0 리셋(정지로 단정 안 함).
+    한도 초과를 STALL_CONFIRM 회 **연속** 확인하면 발동(True). 새 커밋이 오면 strike 리셋.
+    """
+
+    def __init__(self, repo: str | None, poll_start: float):
+        self.repo = repo or ""
+        self.poll_start = poll_start
+        self.grace = _watchdog_grace_s()
+        self.floor = _watchdog_noprogress_s()
+        self.active = bool(self.repo) and self.grace > 0 and self.floor > 0
+        self.first_running_ts: float | None = None
+        self.last_check = poll_start
+        self.last_commit_epoch = 0.0      # 지금까지 관측한 최신 커밋 시각(새 커밋 감지용)
+        self.max_interval = 0.0           # 관측된 최대 커밋 간격
+        self.strike = 0
+        self.stall_minutes = 0            # heartbeat 표시용(마지막 점검 기준)
+        self.limit_minutes = 0
+        self.last_title = ""
+
+    def note_running(self, now: float) -> None:
+        """status 가 running 으로 읽힌 폴에서 호출 — 처음 running 본 시각을 잠근다.
+        (queued 동안은 호출되지 않으므로 '시계가 안 간다'.)"""
+        if self.active and self.first_running_ts is None:
+            self.first_running_ts = now
+
+    def should_check(self, now: float) -> bool:
+        return (self.active and self.first_running_ts is not None
+                and (now - self.last_check) >= WATCHDOG_CHECK_S)
+
+    def check(self, now: float) -> bool:
+        """워치독 1회 점검 → 발동해야 하면 True. HF 조회는 이 안에서 1회."""
+        self.last_check = now
+        commit = latest_checkpoint_commit(self.repo)
+        if commit is None:
+            self.strike = 0                       # 모름 = 정지 아님
+            return False
+        title, created = commit
+        self.last_title = title
+        if created > self.last_commit_epoch:      # 새 커밋 관측 → 간격 갱신
+            prev = self.last_commit_epoch if self.last_commit_epoch > 0 else self.first_running_ts
+            if prev is not None:
+                interval = created - prev
+                if interval > self.max_interval:
+                    self.max_interval = interval
+            self.last_commit_epoch = created
+        this_run = created > (self.poll_start - 120)
+        if this_run:
+            baseline = created
+            limit = max(self.floor, NOPROGRESS_ADAPT * self.max_interval)
+        else:
+            baseline = self.first_running_ts if self.first_running_ts is not None else self.poll_start
+            limit = self.grace
+        elapsed = now - baseline
+        self.stall_minutes = int(max(0.0, elapsed) // 60)
+        self.limit_minutes = int(limit // 60)
+        if elapsed > limit:
+            self.strike += 1
+        else:
+            self.strike = 0
+        return self.strike >= STALL_CONFIRM
+
 #: 폴링 진실 가드(#1, 2026-11-14). status 조회가 **연속** 이만큼 실패하면(blind) 생사
 #: 판정 불가로 본다. 예전엔 rc 를 버리고 'complete'/'error' 를 **부분문자열**로 찾아,
 #: 조회 실패 로그(ConnectionError)나 슬러그('freecloud-error-x')의 'error' 를 종결로 오독했다.
@@ -524,6 +627,7 @@ class KaggleProvider(Provider):
         st = ""
         blind = 0                       # 연속 상태조회 실패 횟수(#1)
         last_word = ""                  # 마지막으로 **읽힌** 상태어(상한 도달 시 생사 판정 기준)
+        wd = _NoProgressWatchdog(job.checkpoint_repo, start)   # 무진행 워치독(A)
         while time.time() < deadline:
             time.sleep(60)
             rc, st = self._sh(["kaggle", "kernels", "status", kid], 60, _UTF8)
@@ -534,8 +638,10 @@ class KaggleProvider(Provider):
                 last_word = word
             else:
                 blind += 1
+            if word == "running":
+                wd.note_running(now)
             if now - last_hb >= HEARTBEAT_S:
-                self._heartbeat(job, kid, now - start, st, blind)
+                self._heartbeat(job, kid, now - start, st, blind, wd)
                 last_hb = now
             # ── 종결 판정은 상태어 **완전일치**로만(부분문자열 종결 오독 차단, #1) ──────
             if word == "complete":
@@ -571,6 +677,20 @@ class KaggleProvider(Provider):
                 return RunResult(False, "error",
                                  f"CANCELLED: 커널이 취소됨(cancel_acknowledged, kernel={kid}). "
                                  f"회수본={adir}", (diag or st)[-1200:], "CANCELLED", adir)
+            # ── 무진행 워치독(A): running 으로 읽힌 폴에서만, WATCHDOG_CHECK_S 마다 ──────
+            if word == "running" and wd.should_check(now):
+                if wd.check(now):
+                    stopped, swhy = self.stop_kernel(kid)
+                    print(f"[{self.name}] 무진행 워치독 발동 — 커널 중지 "
+                          f"{'완료' if stopped else '실패'}: {swhy}", flush=True)
+                    return RunResult(
+                        False, "error",
+                        f"STALLED: {wd.stall_minutes}분째 진행신호 없음(한도 {wd.limit_minutes}분, "
+                        f"마지막={wd.last_title or '(없음)'}). 커널 중지 "
+                        f"{'완료' if stopped else '실패'}: {swhy}. 원인 후보: (1) 학습 데드락/행 "
+                        f"(2) HF 업로드 실패로 커밋 안 됨 (3) OOM 후 좀비 (4) 데이터로더 정지. "
+                        f"`fcc logs {job.name}` 로 확인.",
+                        (st or "")[-400:], "STALLED", pushed=True, remote_alive=not stopped)
             # ── 상태조회가 연속 POLL_BLIND_MAX 회 실패 → 생사 판정 불가(#1) ──────────
             if blind >= POLL_BLIND_MAX:
                 if job.checkpoint_repo:
@@ -666,12 +786,24 @@ def _parse_last_run_time(csv_text: str, kid: str) -> str:
 
 
 # ── D. OAuth access token (3시간 수명 → refresh_token 으로 자동 갱신) ────────
-def latest_checkpoint_title(repo: str) -> str:
-    """HF checkpoint_repo 의 최신 커밋 제목(예: 'checkpoint step=200'). 실패하면 ''.
+def _commit_epoch(created) -> float:
+    """HF 커밋의 created_at(datetime 또는 숫자) → epoch 초. 못 읽으면 0.0."""
+    try:
+        if created is None:
+            return 0.0
+        if hasattr(created, "timestamp"):
+            return float(created.timestamp())
+        return float(created)
+    except Exception:
+        return 0.0
 
-    heartbeat 용 부가정보일 뿐이라 **어떤 예외도 밖으로 내보내지 않는다** — HF 가
-    잠깐 흔들린다고 몇 시간짜리 폴링이 죽으면 안 된다. 테스트는 이 함수를 몽키패치한다.
-    """
+
+def latest_checkpoint_commit(repo: str) -> "tuple[str, float] | None":
+    """HF checkpoint_repo 의 최신 커밋 → (제목, created_at epoch) 또는 None.
+
+    **어떤 예외도 밖으로 내보내지 않는다**(None 반환) — HF 가 잠깐 흔들린다고 몇 시간짜리
+    폴링/워치독이 죽으면 안 된다. 워치독은 None 을 '모름(정지 아님)'으로 다룬다.
+    테스트는 이 함수를 몽키패치한다(conftest 가 기본적으로 None 으로 막는다)."""
     try:
         from huggingface_hub import HfApi
         tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
@@ -679,9 +811,21 @@ def latest_checkpoint_title(repo: str) -> str:
             from .. import secrets
             tok = secrets.get("HF_TOKEN") or secrets.get("HUGGINGFACE_TOKEN")
         commits = HfApi(token=tok or None).list_repo_commits(repo)
-        return str(commits[0].title) if commits else ""
+        if not commits:
+            return None
+        c = commits[0]
+        return str(getattr(c, "title", "") or ""), _commit_epoch(getattr(c, "created_at", None))
     except Exception:
-        return ""
+        return None
+
+
+def latest_checkpoint_title(repo: str) -> str:
+    """HF checkpoint_repo 의 최신 커밋 제목(예: 'checkpoint step=200'). 실패하면 ''.
+
+    heartbeat 용 부가정보. latest_checkpoint_commit 을 감싼 것 — 예외는 그 안에서 삼킨다.
+    """
+    c = latest_checkpoint_commit(repo)
+    return c[0] if c else ""
 
 
 def _credentials_path() -> str:

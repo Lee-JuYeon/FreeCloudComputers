@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import pytest
+
 from freecloud.job import Job
 from freecloud.providers import kaggle as K
 from freecloud.providers.kaggle import KaggleProvider
@@ -55,6 +57,7 @@ def test_no_heartbeat_before_interval(monkeypatch, capsys):
     assert _beats(capsys.readouterr().out) == []
 
 
+@pytest.mark.allow_hf
 def test_hf_hiccup_never_breaks_polling(monkeypatch, capsys):
     import sys
     import types
@@ -76,6 +79,7 @@ def test_hf_hiccup_never_breaks_polling(monkeypatch, capsys):
     assert "ckpt=(조회 실패/없음)" in _beats(capsys.readouterr().out)[0]
 
 
+@pytest.mark.allow_hf
 def test_latest_checkpoint_title_reads_first_commit(monkeypatch):
     import sys
     import types
