@@ -49,6 +49,12 @@ HEARTBEAT_S = 600
 #: 이 문자열이 status 에 있으면 커널이 아직 살아 있다(완료/오류 전).
 _ALIVE_MARKERS = ("running", "queued")
 
+#: 폴링 진실 가드(#1, 2026-11-14). status 조회가 **연속** 이만큼 실패하면(blind) 생사
+#: 판정 불가로 본다. 예전엔 rc 를 버리고 'complete'/'error' 를 **부분문자열**로 찾아,
+#: 조회 실패 로그(ConnectionError)나 슬러그('freecloud-error-x')의 'error' 를 종결로 오독했다.
+#: 이제 상태어 **완전일치**로만 판정하고, 못 읽으면 blind 를 세다가 상한에서 멈춘다.
+POLL_BLIND_MAX = 20
+
 #: stale-kernel 가드(2026-10-16 수리). push 가 rc=0 이어도 새 세션을 못 띄우면
 #: (쿼터 소진 시 재발, 10-08·10-16) 폴링이 옛 COMPLETE 를 성공으로 읽는다.
 #: push 전후로 lastRunTime/status 변화를 최대 이 시간(초)만큼 폴링해 확인한다.
@@ -323,8 +329,8 @@ class KaggleProvider(Provider):
         """
         rc, out = self._sh(["kaggle", "kernels", "list", "-m", "-v"], 60, _UTF8)
         last = _parse_last_run_time(out, kid) if rc == 0 else ""
-        _, st = self._sh(["kaggle", "kernels", "status", kid], 60, _UTF8)
-        return last, self._status_word(st or "")
+        rc2, st = self._sh(["kaggle", "kernels", "status", kid], 60, _UTF8)
+        return last, self._parse_status(rc2, st or "")
 
     def _wait_kernel_started(self, kid: str, before: tuple[str, str]) -> tuple[bool, str]:
         """push 가 실제로 새 세션을 띄웠는지 최대 STALE_KERNEL_POLL_S 폴링 → (stale?, 사유).
@@ -440,15 +446,41 @@ class KaggleProvider(Provider):
 
     @staticmethod
     def _status_word(st: str) -> str:
-        """`kaggle kernels status` 출력 → 짧은 상태어. 예: 'KernelWorkerStatus.RUNNING' → 'running'."""
+        """`kaggle kernels status` 출력 → 짧은 상태어. 예: 'KernelWorkerStatus.RUNNING' → 'running'.
+
+        ⚠️ 꼬리60자 폴백은 **heartbeat 표시용만** 이다 — 종결/생사 판정에는 쓰지 않는다
+        (그건 _parse_status 의 엄격파서로만). 둘을 섞으면 '못 읽음'이 가짜 상태어로 둔갑한다.
+        """
         m = re.search(r'status\s+"?([A-Za-z_.]+)"?', st or "")
         word = m.group(1) if m else (st or "").strip()[-60:]
         return word.rsplit(".", 1)[-1].lower() or "?"
 
-    def _heartbeat(self, job: Job, kid: str, elapsed: float, st: str) -> None:
-        """폴링 생존 신호 한 줄. checkpoint_repo 가 있으면 최신 커밋 제목도 붙인다."""
+    @staticmethod
+    def _parse_status(rc: int, st: str) -> str:
+        """판정용 **엄격** 상태 파서 → 소문자 상태어 또는 ''(못 읽음).
+
+        rc==0 이고 `status "<word>"` 패턴이 매치될 때만 그 상태어를 돌려준다. 그 외(네트워크
+        오류 rc!=0, 패턴 불일치)는 '' — 호출부는 '못 읽음'으로 처리한다(blind). _status_word
+        의 꼬리60자 폴백을 쓰지 않는 게 핵심이다(설계 §C2: 부분문자열 종결 오독 차단)."""
+        if rc != 0:
+            return ""
+        m = re.search(r'status\s+"?([A-Za-z_.]+)"?', st or "")
+        if not m:
+            return ""
+        return m.group(1).rsplit(".", 1)[-1].lower()
+
+    def _heartbeat(self, job: Job, kid: str, elapsed: float, st: str,
+                   blind: int = 0, wd: "_NoProgressWatchdog | None" = None) -> None:
+        """폴링 생존 신호 한 줄. checkpoint_repo 가 있으면 최신 커밋 제목도 붙인다.
+
+        blind>0 이면 '상태조회 실패 N회 연속', 무진행 워치독이 측정 중이면 '무진행 N분/한도 M분'.
+        status 표시는 _status_word(꼬리 폴백 포함) — 어디까지나 **표시용**이다."""
         line = (f"[{self.name}] ♥ {int(elapsed) // 60}분 경과 · kernel={kid} "
                 f"· status={self._status_word(st)}")
+        if blind:
+            line += f" · 상태조회 실패 {blind}회 연속"
+        if wd is not None and wd.active and wd.limit_minutes > 0:
+            line += f" · 무진행 {wd.stall_minutes}분/한도 {wd.limit_minutes}분"
         if job.checkpoint_repo:
             title = latest_checkpoint_title(job.checkpoint_repo)
             line += f" · ckpt={title or '(조회 실패/없음)'}"
@@ -490,15 +522,23 @@ class KaggleProvider(Provider):
         deadline = start + job.max_runtime_s
         last_hb = start
         st = ""
+        blind = 0                       # 연속 상태조회 실패 횟수(#1)
+        last_word = ""                  # 마지막으로 **읽힌** 상태어(상한 도달 시 생사 판정 기준)
         while time.time() < deadline:
             time.sleep(60)
             rc, st = self._sh(["kaggle", "kernels", "status", kid], 60, _UTF8)
-            low = st.lower()
+            word = self._parse_status(rc, st)     # 엄격파서: 못 읽으면 ''
             now = time.time()
+            if word:
+                blind = 0
+                last_word = word
+            else:
+                blind += 1
             if now - last_hb >= HEARTBEAT_S:
-                self._heartbeat(job, kid, now - start, st)
+                self._heartbeat(job, kid, now - start, st, blind)
                 last_hb = now
-            if "complete" in low:
+            # ── 종결 판정은 상태어 **완전일치**로만(부분문자열 종결 오독 차단, #1) ──────
+            if word == "complete":
                 adir, diag = self.fetch_outputs(job, kid)
                 got = self.assigned_gpu(diag)
                 want = job.needs.get("gpu")
@@ -520,15 +560,34 @@ class KaggleProvider(Provider):
                 return RunResult(True, "done",
                                  f"Kaggle 완료(GPU={got or '?'}). 산출물 → {adir}",
                                  st[-400:], "", adir)
-            if "error" in low:
+            if word == "error":
                 adir, diag = self.fetch_outputs(job, kid)
                 d = classify(st + "\n" + diag)
                 return RunResult(False, "error", d.advice, (diag or st)[-1200:],
                                  d.error_class, adir)
+            if word == "cancel_acknowledged":
+                # 사용자가(또는 우리가) 커널을 취소함 → 재시도/페일오버 무의미(CANCELLED, ABORT).
+                adir, diag = self.fetch_outputs(job, kid)
+                return RunResult(False, "error",
+                                 f"CANCELLED: 커널이 취소됨(cancel_acknowledged, kernel={kid}). "
+                                 f"회수본={adir}", (diag or st)[-1200:], "CANCELLED", adir)
+            # ── 상태조회가 연속 POLL_BLIND_MAX 회 실패 → 생사 판정 불가(#1) ──────────
+            if blind >= POLL_BLIND_MAX:
+                if job.checkpoint_repo:
+                    return RunResult(False, "detached",
+                                     f"상태조회 {POLL_BLIND_MAX}회 연속 실패 — 커널은 계속 실행 "
+                                     f"중일 수 있다(kernel={kid}). 산출물은 "
+                                     f"checkpoint_repo({job.checkpoint_repo}) 에서 회수.",
+                                     (st or "")[-400:], "DETACHED", remote_alive=True)
+                return RunResult(False, "error",
+                                 f"POLL_BLIND: 상태조회 {POLL_BLIND_MAX}회 연속 실패 — 생사 판정 "
+                                 f"불가(kernel={kid}). `fcc logs {job.name}` 로 확인.",
+                                 (st or "")[-400:], "POLL_BLIND", remote_alive=True)
         # ── 폴링 상한 도달 ───────────────────────────────────────────────────
         # 2026-09-30 실측: 커널은 ~4시간짜리였는데 5400s 에서 TIMEOUT 으로 끊고 다른
         # provider 로 넘어갔다 — 원격 커널은 checkpoint 를 계속 push 하는 **고아**가 됐다.
-        alive = any(m in (st or "").lower() for m in _ALIVE_MARKERS)
+        # 생사 판정은 마지막 raw st 가 아니라 **마지막으로 읽힌 상태어**(last_word)로 한다(#1).
+        alive = last_word in _ALIVE_MARKERS
         if alive and job.checkpoint_repo:
             # 살아 있고 결과를 받을 곳(checkpoint_repo)도 있다 → 실패가 아니라 '분리'.
             # 오케스트레이터는 쿨다운·재시도·다른 provider 없이 멈춘다(이중 학습 방지).
