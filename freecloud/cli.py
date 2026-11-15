@@ -178,7 +178,13 @@ def _hf_token():
 def _cmd_ckpt_status(args) -> int:
     """fcc ckpt status <repo> — 저장소 LFS 사용량·보존/고아 현황(읽기전용)."""
     from . import hf_storage
-    rep = hf_storage.storage_report(args.repo, _hf_token())
+    try:
+        rep = hf_storage.storage_report(args.repo, _hf_token())
+    except Exception as e:
+        # 네트워크/권한/미설치 등으로 조회가 터져도 트레이스백을 그대로 쏟지 않고
+        # 사람이 읽을 한 줄로 정리해 1 로 종료한다(읽기전용이라 부작용 없음).
+        print(f"[FAIL] ckpt status 조회 실패({type(e).__name__}): {str(e)[:120]}")
+        return 1
     print(f"repo: {rep.repo}")
     print(f"  LFS 사용: {hf_storage.human(rep.used_bytes)}  ({rep.lfs_count} files)")
     print(f"  보존   : {rep.keep_count}개  {hf_storage.human(rep.keep_bytes)}")
@@ -197,15 +203,24 @@ def _cmd_ckpt_squash(args) -> int:
     from . import hf_storage
     repo, tok = args.repo, _hf_token()
     min_age_s = int(args.min_age_min) * 60
+    keep_revs = tuple(args.keep_revision or ())
 
-    plan = hf_storage.prune_orphans(repo, tok, min_age_s=min_age_s, dry_run=True)
+    plan = hf_storage.prune_orphans(repo, tok, min_age_s=min_age_s, dry_run=True,
+                                    keep_revisions=keep_revs)
     print(f"[plan] repo={repo}")
     if plan.aborted:
         print(f"  보존집합 문제 → 아무것도 삭제하지 않습니다(fail-closed): {plan.detail}")
         return 1
     print(f"  보존 LFS {plan.kept_count}개 / 삭제대상 고아 {plan.deleted_count}개"
           f"({hf_storage.human(plan.deleted_bytes)}) / 최근<{args.min_age_min}분 제외 {plan.skipped_recent}개")
+    if keep_revs:
+        print(f"  추가 보존 리비전(--keep-revision): {', '.join(keep_revs)}")
     print(f"  squash : {'건너뜀(--no-squash)' if args.no_squash else 'main 히스토리 1커밋으로 축약'}")
+    if not args.no_squash:
+        # squash 는 main 에 'fcc squash' 커밋을 하나 만든다 → 무진행 워치독이 이를 한 번
+        # '진행'으로 오인한다. 실행 중인 학습이 있으면 squash 를 미루라고 경고한다.
+        print("  ⚠ 경고: squash 는 main 에 커밋을 남겨 무진행 워치독이 한 번 '진행'으로 오인합니다. "
+              "실행 중인 학습이 있으면 squash 하지 말고 끝난 뒤 돌리세요(--no-squash 로 고아만 삭제 가능).")
 
     if args.dry_run:
         print("[dry-run] 쓰기/삭제 없음 — 계획만 출력했습니다.")
@@ -223,7 +238,7 @@ def _cmd_ckpt_squash(args) -> int:
     if not args.no_squash:
         hf_storage.super_squash(repo, tok)
         print("[squash] main 히스토리 축약 완료.")
-    pr = hf_storage.prune_orphans(repo, tok, min_age_s=min_age_s)
+    pr = hf_storage.prune_orphans(repo, tok, min_age_s=min_age_s, keep_revisions=keep_revs)
     if pr.aborted:
         print(f"[중단] {pr.detail}")
         return 1
@@ -306,6 +321,9 @@ def main(argv=None) -> int:
     cksq.add_argument("--no-squash", action="store_true", help="squash 없이 고아만 삭제")
     cksq.add_argument("--min-age-min", type=int, default=60,
                       help="이 분 이내 push 된 블롭은 보존(기본 60)")
+    cksq.add_argument("--keep-revision", action="append", metavar="REV",
+                      help="보존할 추가 리비전(브랜치/태그/커밋 sha). 반복 지정 가능 "
+                           "(job 의 checkpoint_keep_revisions 와 동일 역할)")
     cksq.set_defaults(fn=_cmd_ckpt_squash)
 
     lg = sub.add_parser("login", help="provider 로그인/토큰 등록(1회)")

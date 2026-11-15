@@ -81,14 +81,21 @@ def _lfs_sha_of_revision(api, repo: str, revision: str, tok: str | None) -> set[
 
 
 def _keep_shas(api, repo: str, tok: str | None, keep_revisions) -> set[str]:
-    """보존할 LFS sha256 = (모든 브랜치 head + 모든 태그 + keep_revisions) 트리의 합집합.
+    """보존할 LFS sha256 = (모든 브랜치 head + 태그 + PR head + keep_revisions) 트리의 합집합.
+
+    ★`include_pull_requests=True` 로 `refs/pr/*` 까지 읽는다. PR 에만 실린 LFS(아직 머지 안
+    된 체크포인트 브랜치 등)가 어느 산 브랜치/태그에도 없으면 고아로 분류돼 **영구삭제**되기
+    때문 — PR head 트리도 보존집합에 넣어 막는다.
 
     조회가 하나라도 실패하면 예외가 그대로 올라간다 — 호출부(prune)가 그걸 잡아
     **fail-closed(삭제 0)** 로 처리한다. 반쪽 보존집합으로 삭제하면 산 체크포인트가 날아간다.
     """
-    refs = api.list_repo_refs(repo, repo_type="model", token=tok)
+    refs = api.list_repo_refs(repo, repo_type="model", token=tok,
+                              include_pull_requests=True)
     revs: list[str] = []
-    for r in list(getattr(refs, "branches", None) or []) + list(getattr(refs, "tags", None) or []):
+    for r in (list(getattr(refs, "branches", None) or [])
+              + list(getattr(refs, "tags", None) or [])
+              + list(getattr(refs, "pull_requests", None) or [])):
         rev = getattr(r, "target_commit", None) or getattr(r, "name", None)
         if rev:
             revs.append(rev)

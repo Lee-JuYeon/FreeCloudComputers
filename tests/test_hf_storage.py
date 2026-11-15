@@ -33,9 +33,10 @@ class _Ref:
 
 
 class _Refs:
-    def __init__(self, branches, tags):
+    def __init__(self, branches, tags, pull_requests=None):
         self.branches = branches
         self.tags = tags
+        self.pull_requests = pull_requests or []
 
 
 class _Sibling:
@@ -66,6 +67,7 @@ class FakeApi:
         return _Info([_Sibling(s) for s in self.tree.get(revision, [])])
 
     def list_repo_refs(self, repo, *, repo_type=None, token=None, include_pull_requests=False):
+        self.refs_pr_flag = include_pull_requests
         return self.refs
 
     def list_lfs_files(self, repo, *, repo_type=None, token=None):
@@ -340,6 +342,25 @@ def test_prune_dry_run_writes_nothing(monkeypatch):
     assert api.deleted == [] and orphan in api.lfs   # 실제 삭제 0
 
 
+# ── item1: PR ref 보존(refs/pr/* 에만 실린 LFS 는 고아가 아니다) ────────────────
+@pytest.mark.allow_hf_storage
+def test_prune_keeps_pr_only_blob(monkeypatch):
+    """PR head 트리에만 있는 블롭은 어느 브랜치/태그에도 없어도 보존돼야 한다(고아 아님)."""
+    old = datetime.now(timezone.utc) - timedelta(days=5)
+    pr_blob = _Blob("PRB", filename="pr.safetensors", pushed_at=old)
+    orphan = _Blob("ORPH", filename="o.bin", pushed_at=old)
+    api = FakeApi(
+        tree={"C_MAIN": ["KEEP"], "C_PR1": ["PRB"]},
+        refs=_Refs([_Ref("main", "C_MAIN")], [],
+                   pull_requests=[_Ref("refs/pr/1", "C_PR1")]),
+        lfs=[_Blob("KEEP", pushed_at=old), pr_blob, orphan])
+    _wire_api(monkeypatch, api)
+    res = hf_storage.prune_orphans("user/ckpt", "hf_x")
+    assert api.refs_pr_flag is True            # include_pull_requests 를 실제로 넘겼다
+    assert res.deleted_count == 1              # orphan 만 삭제
+    assert pr_blob in api.lfs and orphan not in api.lfs
+
+
 # ── orchestrator 프리플라이트 ─────────────────────────────────────────────────
 class Fake(Provider):
     def __init__(self, name="fake"):
@@ -381,7 +402,8 @@ from freecloud import cli  # noqa: E402
 
 
 def _squash_args(**kw):
-    base = dict(repo="user/ckpt", dry_run=False, yes=False, no_squash=False, min_age_min=60)
+    base = dict(repo="user/ckpt", dry_run=False, yes=False, no_squash=False,
+                min_age_min=60, keep_revision=None)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -414,3 +436,52 @@ def test_cli_squash_dry_run_writes_nothing(monkeypatch):
     rc = cli._cmd_ckpt_squash(_squash_args(dry_run=True))
     assert rc == 0
     assert squashed == [] and calls == [dict(dry_run=True)]   # 계획(dry)만, 실삭제·squash 0
+
+
+# ── item2: --keep-revision 가 prune 의 보존집합까지 전달된다 ───────────────────
+@pytest.mark.allow_hf_storage
+def test_cli_squash_keep_revision_passthrough(monkeypatch):
+    """--keep-revision 로 지정한 리비전 트리의 블롭은 삭제되지 않고 보존돼야 한다."""
+    old = datetime.now(timezone.utc) - timedelta(days=5)
+    kr_blob = _Blob("KR", filename="kr.bin", pushed_at=old)    # main 트리엔 없음
+    orphan = _Blob("ORPH", filename="o.bin", pushed_at=old)
+    api = FakeApi(tree={"C_MAIN": ["KEEP"], "C_KR": ["KR"]},
+                  lfs=[_Blob("KEEP", pushed_at=old), kr_blob, orphan])
+    _wire_api(monkeypatch, api)
+    monkeypatch.setattr(cli, "_hf_token", lambda: "x")
+    rc = cli._cmd_ckpt_squash(_squash_args(yes=True, no_squash=True,
+                                           keep_revision=["C_KR"]))
+    assert rc == 0
+    assert kr_blob in api.lfs and orphan not in api.lfs
+    # keep_revision 없으면 kr_blob 은 고아로 삭제됨(대조군)
+    kr2 = _Blob("KR", filename="kr.bin", pushed_at=old)
+    api2 = FakeApi(tree={"C_MAIN": ["KEEP"], "C_KR": ["KR"]},
+                   lfs=[_Blob("KEEP", pushed_at=old), kr2])
+    _wire_api(monkeypatch, api2)
+    cli._cmd_ckpt_squash(_squash_args(yes=True, no_squash=True))
+    assert kr2 not in api2.lfs
+
+
+# ── item3: squash 경고(무진행 워치독 오인) ────────────────────────────────────
+@pytest.mark.allow_hf_storage
+def test_cli_squash_warns_when_squashing(monkeypatch, capsys):
+    calls, squashed = _fake_prune(monkeypatch)
+    cli._cmd_ckpt_squash(_squash_args(dry_run=True, no_squash=False))
+    assert "워치독" in capsys.readouterr().out
+    # --no-squash 면 커밋을 안 만드니 경고도 없다
+    _fake_prune(monkeypatch)
+    cli._cmd_ckpt_squash(_squash_args(dry_run=True, no_squash=True))
+    assert "워치독" not in capsys.readouterr().out
+
+
+# ── item5: ckpt status 예외 시 트레이스백 대신 깔끔한 에러 ─────────────────────
+@pytest.mark.allow_hf_storage
+def test_cli_status_exception_clean_message(monkeypatch, capsys):
+    def _boom(tok=None):
+        raise RuntimeError("조회 폭발(시뮬)")
+    monkeypatch.setattr(hf_storage, "_api", _boom)
+    monkeypatch.setattr(cli, "_hf_token", lambda: "x")
+    rc = cli._cmd_ckpt_status(argparse.Namespace(repo="user/ckpt"))
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "[FAIL]" in out and "조회 폭발" in out
