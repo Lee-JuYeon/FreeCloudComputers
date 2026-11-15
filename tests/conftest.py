@@ -13,6 +13,8 @@ def pytest_configure(config):
         "markers", "allow_hf: latest_checkpoint_commit 블록(_block_hf_checkpoint)을 건너뛴다")
     config.addinivalue_line(
         "markers", "real_stop: stop_running_session 기본 차단을 건너뛴다(가짜 playwright 로 실함수 검증)")
+    config.addinivalue_line(
+        "markers", "allow_hf_storage: hf_storage._api 기본 차단을 건너뛴다(가짜 HfApi 를 직접 심는다)")
 
 
 @pytest.fixture(autouse=True)
@@ -44,3 +46,19 @@ def _block_hf_checkpoint(request, monkeypatch):
         return
     from freecloud.providers import kaggle as _K
     monkeypatch.setattr(_K, "latest_checkpoint_commit", lambda repo: None, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _block_hf_storage(request, monkeypatch):
+    """hf_storage 의 HfApi 생성(_api)을 기본 차단 — 실수로라도 네트워크를 두드리지 못하게.
+
+    storage_report/prune/write_probe/hygiene 등 모든 HF 호출이 이 한 함수를 지난다. 위생 경로를
+    검증하는 테스트는 `@pytest.mark.allow_hf_storage` 로 블록을 끄고 가짜 HfApi 를 직접 심는다."""
+    if request.node.get_closest_marker("allow_hf_storage"):
+        return
+    from freecloud import hf_storage as _S
+
+    def _blocked(tok=None):
+        raise RuntimeError("테스트: hf_storage._api 차단(네트워크 0)")
+
+    monkeypatch.setattr(_S, "_api", _blocked, raising=False)

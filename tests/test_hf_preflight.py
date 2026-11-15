@@ -94,7 +94,7 @@ def test_preflight_blocks_before_dispatch(monkeypatch):
 
 def test_preflight_passes_with_valid_token(monkeypatch):
     monkeypatch.setattr(auth, "verify_hf_token", lambda t: (True, "ok"))
-    monkeypatch.setattr(auth, "verify_hf_write", lambda r, t=None: (True, "쓰기 OK"))
+    monkeypatch.setattr(auth, "verify_hf_write", lambda r, t=None, **kw: (True, "쓰기 OK"))
     fake = Fake()
     _wire(monkeypatch, fake)
     job = Job(name="t", entrypoint="x", checkpoint_repo="user/ckpt")
@@ -107,7 +107,7 @@ def test_preflight_blocks_when_token_cannot_write(monkeypatch):
     안 그러면 런이 끝나갈 무렵 체크포인트 push 에서 401 이 나고 쿼터를 날린다."""
     monkeypatch.setattr(auth, "verify_hf_token", lambda t: (True, "ok"))
     monkeypatch.setattr(auth, "verify_hf_write",
-                        lambda r, t=None: (False, "토큰에 쓰기 권한이 없습니다"))
+                        lambda r, t=None, **kw: (False, "토큰에 쓰기 권한이 없습니다"))
     fake = Fake()
     _wire(monkeypatch, fake)
     job = Job(name="t", entrypoint="x", checkpoint_repo="user/ckpt")

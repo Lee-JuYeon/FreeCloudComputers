@@ -63,14 +63,16 @@ def _provider(monkeypatch, calls, rcmap=None):
     return p
 
 
-# ── 불변조건 1: Job 스키마는 12개 키 그대로 ─────────────────────────────────
+# ── 불변조건 1: Job 스키마 키 고정(용량 위생 2키 추가 = 14개) ──────────────────
 def test_job_schema_keys_unchanged():
     keys = sorted(Job.__dataclass_fields__)
     assert keys == sorted([
         "name", "entrypoint", "repo", "workdir", "checkpoint_repo", "artifacts",
         "needs", "env", "secrets", "max_runtime_s", "providers", "success_glob",
+        # HF 용량 위생(E): 정책 + 보존 revision. 둘 다 기본값 있어 기존 job.yaml 호환.
+        "checkpoint_hygiene", "checkpoint_keep_revisions",
     ])
-    assert len(keys) == 12
+    assert len(keys) == 14
 
 
 # ── 불변조건 3: workdir 없을 때 커널 스크립트 바이트 동일 ───────────────────
