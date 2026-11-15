@@ -103,6 +103,57 @@ providers: [lightning, kaggle, colab, modal]
   `[kaggle-ui] ♥ 30분 경과 · kernel=… · status=running · ckpt=checkpoint step=200` 한 줄을
   찍습니다(`ckpt=` 는 `checkpoint_repo` 의 최신 HF 커밋 제목, 조회 실패는 무시).
 
+## 체크포인트 저장소 용량 위생(자가청소)
+
+`checkpoint_repo` 는 매 push 마다 새 LFS 블롭이 쌓입니다. 과거 커밋의 블롭은 어느 산
+브랜치/태그도 참조하지 않는 **고아**가 되어 HF 계정 저장소를 채웁니다. 저장소가 가득 차면
+push 가 `403 (private storage limit reached)` 로 **저장만** 실패하고, 커널은 running 인데
+진행이 0 인 상태로 멈춥니다(2026-10-31 실측). 토큰 문제가 아니라 용량 문제입니다.
+
+**job.yaml `checkpoint_hygiene`** (프리플라이트에서 자동 수행, 기본 `warn`):
+
+| 값 | 동작 |
+|---|---|
+| `off` | 점검 안 함 |
+| `warn` (기본) | 고아를 세어 경고만, **삭제는 안 함**(삭제는 사람 결정) |
+| `auto` | 프로브 전에 고아 LFS 를 **자동 영구삭제** |
+
+```yaml
+checkpoint_repo: "your-hf-username/demo-lora-ckpt"
+checkpoint_hygiene: warn            # off | warn | auto
+checkpoint_keep_revisions: []       # 추가로 보존할 브랜치/태그/커밋 sha
+```
+
+보존집합 = 모든 브랜치 head + 태그 + **PR head(`refs/pr/*`)** + `checkpoint_keep_revisions`
+트리의 LFS sha256 합집합. 이 집합을 **하나라도 못 읽으면 삭제 0**(fail-closed) — 반쪽
+집합으로 지우면 산 체크포인트가 날아갑니다.
+
+> ⚠️ **`auto` 는 동시 학습 중 위험이 남습니다.** 다른 커널이 1시간 넘게 업로드 중인
+> 블롭은 "최근(<`min_age` 기본 1h)"에 안 걸려 고아로 보일 수 있습니다. `min_age` 1h 가
+> 대부분을 막지만 완전하지는 않습니다. 같은 저장소로 **여러 커널이 동시에 학습**한다면
+> `auto` 대신 `warn` + 학습이 끝난 뒤 수동 `fcc ckpt squash` 를 권합니다.
+
+**수동 CLI** — 읽기/삭제를 사람이 직접:
+
+```bash
+fcc ckpt status <repo>        # LFS 사용량·보존/고아 현황(읽기전용)
+fcc ckpt squash <repo>        # main 히스토리 1커밋 축약 + 고아 LFS 영구삭제(되돌릴 수 없음)
+    [--dry-run]               #   계획만 출력(쓰기/삭제 0)
+    [--yes]                   #   확인 생략(비대화형 필수)
+    [--no-squash]             #   squash 없이 고아만 삭제
+    [--min-age-min N]         #   이 분 이내 push 된 블롭은 보존(기본 60)
+    [--keep-revision REV]     #   보존할 추가 리비전(반복 지정, job 의 keep_revisions 와 동일)
+```
+
+> ⚠️ **학습 중에는 `fcc ckpt squash` 를 하지 마세요.** squash 는 main 에 `fcc squash`
+> 커밋을 하나 남기는데, 무진행 워치독이 이 커밋을 한 번 **'진행'으로 오인**합니다. 돌고
+> 있는 학습이 있으면 끝난 뒤에 돌리거나, 꼭 지금 치워야 하면 `--no-squash`(커밋 없이 고아만
+> 삭제)를 쓰세요. (`usedStorage` 지표는 반영에 수 분 지연이 있습니다.)
+
+**`FCC_HF_PROBE`** — 프리플라이트의 쓰기 프로브 제어. 기본은 임시 브랜치 `fcc-probe` 에
+11MB 를 실제로 올려 **쓰기 권한 + 용량**을 미리 실측하고(끝나면 흔적 삭제), `main` 은 절대
+건드리지 않습니다. `FCC_HF_PROBE=0` 이면 프로브를 생략하고 권한만 확인합니다.
+
 ## 아키텍처
 
 ```
