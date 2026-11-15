@@ -44,9 +44,12 @@ def _preflight(job: Job) -> dict | None:
     def _fail(detail: str, suffix: str = "") -> dict:
         reason = f"프리플라이트 실패(HF): {detail}{suffix}"
         print(f"[orch] {reason}", flush=True)
+        # error_class 를 detail 접두사로 가른다 — 용량 초과(HF_STORAGE_FULL)는 '토큰 확인'(AUTH)이
+        # 아니라 '저장소 청소'가 조치다. 예전엔 AUTH 하드코딩이라 둘이 뭉개졌다(2026-10-31).
+        ec = "HF_STORAGE_FULL" if detail.startswith("HF_STORAGE_FULL") else "AUTH"
         return dict(ok=False, provider=None, reason=reason,
                     attempts=[dict(provider="(preflight)", ok=False,
-                                   error_class="AUTH", reason=detail)])
+                                   error_class=ec, reason=detail)])
 
     needs_hf = bool(job.checkpoint_repo) or any(
         s in ("HF_TOKEN", "HUGGINGFACE_TOKEN") for s in (job.secrets or []))
@@ -62,9 +65,13 @@ def _preflight(job: Job) -> dict | None:
     # ⚠️ whoami 통과 ≠ 쓰기 가능. 체크포인트를 쓸 job 이면 실제 쓰기까지 확인한다 —
     #    안 그러면 런이 다 끝나갈 무렵 push 에서 401 이 나고 쿼터를 날린다.
     if job.checkpoint_repo:
-        ok, wdetail = verify_hf_write(job.checkpoint_repo, tok)
+        ok, wdetail = verify_hf_write(
+            job.checkpoint_repo, tok,
+            hygiene=getattr(job, "checkpoint_hygiene", "warn"),
+            keep_revisions=getattr(job, "checkpoint_keep_revisions", ()))
         if not ok:
             return _fail(wdetail)
+        # wdetail 에 위생 결과(고아 수/청소 요약)가 한 줄로 들어있다 → 그대로 노출.
         print(f"[orch] 프리플라이트 OK: {detail} / {wdetail}", flush=True)
     return None
 

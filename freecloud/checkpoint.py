@@ -107,6 +107,15 @@ class Checkpoint:
             api.upload_folder(folder_path=src, repo_id=self.repo_id, repo_type="model",
                               commit_message=msg)
         except Exception as e:
+            # ★용량 초과(403 storage limit)는 **auth(401/403) 판정보다 먼저** 가린다 —
+            #   403 은 둘 다에 쓰여서, 순서를 바꾸면 '토큰 확인' 이라는 틀린 조언이 나간다
+            #   (2026-10-31 헛짚음). 'hf_storage_full' 토큰을 담아 플레이북이 HF_STORAGE_FULL 로 분류.
+            from . import hf_storage
+            if hf_storage.is_storage_full(e):
+                raise RuntimeError(
+                    f"[checkpoint] HF 계정 저장소 한도 초과(hf_storage_full) — 토큰 문제가 아니라 "
+                    f"저장 공간이 가득 참. 체크포인트는 로컬 '{src}'에 보존됨(유실 없음). "
+                    f"`fcc ckpt squash {self.repo_id}` 로 청소 후 재개. 원인: {str(e)[:120]}") from e
             if _is_auth_error(e):
                 raise RuntimeError(
                     f"[checkpoint] HF 토큰 만료/무효(401 unauthorized) — 체크포인트는 로컬 "

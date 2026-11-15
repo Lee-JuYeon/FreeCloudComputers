@@ -170,6 +170,68 @@ def _cmd_kaggle_stop(args) -> int:
     return 0 if ok else 1
 
 
+def _hf_token():
+    from . import secrets
+    return secrets.get("HF_TOKEN") or secrets.get("HUGGINGFACE_TOKEN")
+
+
+def _cmd_ckpt_status(args) -> int:
+    """fcc ckpt status <repo> — 저장소 LFS 사용량·보존/고아 현황(읽기전용)."""
+    from . import hf_storage
+    rep = hf_storage.storage_report(args.repo, _hf_token())
+    print(f"repo: {rep.repo}")
+    print(f"  LFS 사용: {hf_storage.human(rep.used_bytes)}  ({rep.lfs_count} files)")
+    print(f"  보존   : {rep.keep_count}개  {hf_storage.human(rep.keep_bytes)}")
+    print(f"  고아   : {rep.orphan_count}개  {hf_storage.human(rep.orphan_bytes)}")
+    if rep.orphan_count:
+        print(f"  → 청소(수동): `fcc ckpt squash {args.repo}`")
+    print("  ※ usedStorage 지표는 반영에 수 분 지연이 있습니다.")
+    return 0
+
+
+def _cmd_ckpt_squash(args) -> int:
+    """fcc ckpt squash <repo> — main 히스토리 축약 + 고아 LFS 영구삭제(되돌릴 수 없음).
+
+    흐름: 계획 출력 → 확인(비TTY 는 --yes 필수) → super_squash(옵션) → 고아 prune → 검증.
+    """
+    from . import hf_storage
+    repo, tok = args.repo, _hf_token()
+    min_age_s = int(args.min_age_min) * 60
+
+    plan = hf_storage.prune_orphans(repo, tok, min_age_s=min_age_s, dry_run=True)
+    print(f"[plan] repo={repo}")
+    if plan.aborted:
+        print(f"  보존집합 문제 → 아무것도 삭제하지 않습니다(fail-closed): {plan.detail}")
+        return 1
+    print(f"  보존 LFS {plan.kept_count}개 / 삭제대상 고아 {plan.deleted_count}개"
+          f"({hf_storage.human(plan.deleted_bytes)}) / 최근<{args.min_age_min}분 제외 {plan.skipped_recent}개")
+    print(f"  squash : {'건너뜀(--no-squash)' if args.no_squash else 'main 히스토리 1커밋으로 축약'}")
+
+    if args.dry_run:
+        print("[dry-run] 쓰기/삭제 없음 — 계획만 출력했습니다.")
+        return 0
+
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print("[거부] 비대화형에서는 --yes 가 필요합니다(계획만 보려면 --dry-run).")
+            return 1
+        ans = input("진행할까요? 되돌릴 수 없습니다 [y/N] ").strip().lower()
+        if ans != "y":
+            print("취소됨.")
+            return 1
+
+    if not args.no_squash:
+        hf_storage.super_squash(repo, tok)
+        print("[squash] main 히스토리 축약 완료.")
+    pr = hf_storage.prune_orphans(repo, tok, min_age_s=min_age_s)
+    if pr.aborted:
+        print(f"[중단] {pr.detail}")
+        return 1
+    print(f"[delete] 고아 {pr.deleted_count}개 / {hf_storage.human(pr.deleted_bytes)} 영구삭제.")
+    print("※ usedStorage 지표 반영에는 수 분 지연이 있습니다.")
+    return 0
+
+
 def _cmd_login(args) -> int:
     """freecloud login <provider> — 사이트별 최초 1회 로그인/토큰 등록."""
     from . import auth
@@ -231,6 +293,20 @@ def main(argv=None) -> int:
     ks = sub.add_parser("kaggle-stop", help="실행 중 Kaggle 커널 UI Stop(user/slug)")
     ks.add_argument("kernel", help="user/slug (예: benedictarthur/freecloud-laibrio-gemma4)")
     ks.set_defaults(fn=_cmd_kaggle_stop)
+
+    ck = sub.add_parser("ckpt", help="체크포인트 저장소 용량 위생(status/squash)")
+    cksub = ck.add_subparsers(dest="ckcmd", required=True)
+    cks = cksub.add_parser("status", help="LFS 사용량·고아 현황(읽기전용)")
+    cks.add_argument("repo", help="HF repo id (예: user/myjob-ckpt)")
+    cks.set_defaults(fn=_cmd_ckpt_status)
+    cksq = cksub.add_parser("squash", help="main 히스토리 축약 + 고아 LFS 영구삭제")
+    cksq.add_argument("repo", help="HF repo id")
+    cksq.add_argument("--dry-run", action="store_true", help="계획만 출력(쓰기/삭제 0)")
+    cksq.add_argument("--yes", action="store_true", help="확인 생략(비대화형 필수)")
+    cksq.add_argument("--no-squash", action="store_true", help="squash 없이 고아만 삭제")
+    cksq.add_argument("--min-age-min", type=int, default=60,
+                      help="이 분 이내 push 된 블롭은 보존(기본 60)")
+    cksq.set_defaults(fn=_cmd_ckpt_squash)
 
     lg = sub.add_parser("login", help="provider 로그인/토큰 등록(1회)")
     lg.add_argument("provider", help="huggingface|kaggle|colab|modal|lightning|saturn|kaggle-ui")

@@ -32,6 +32,12 @@ class Job:
     max_runtime_s: int = 5400             # 단일 노드 최대 실행(무료 세션 한도 안쪽)
     providers: list[str] = field(default_factory=list)  # 시도 순서. 비면 registry 기본순.
     success_glob: str = ""                # 성공 판정용 산출물 패턴(mtime 갱신 = 성공)
+    # 체크포인트 저장소 용량 위생 정책(프리플라이트에서 적용):
+    #   warn(기본) — 고아 LFS 누적을 경고만(삭제는 사람/일임, 사용자 결정).
+    #   auto       — 고아 LFS 를 자동 삭제(단 squash 는 안 함). off — 점검 생략.
+    checkpoint_hygiene: str = "warn"
+    # 축약/청소 때 보존할 추가 revision(브랜치·태그 head 외에 꼭 남길 커밋 sha).
+    checkpoint_keep_revisions: list[str] = field(default_factory=list)
 
     @staticmethod
     def load(path: str) -> "Job":

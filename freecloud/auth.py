@@ -46,33 +46,62 @@ def verify_hf_token(tok: str | None) -> tuple[bool, str]:
     return True, f"로그인됨: {name}" + (f" (토큰 role={role})" if role else "")
 
 
-def verify_hf_write(repo_id: str, tok: str | None = None) -> tuple[bool, str]:
-    """`repo_id` 에 실제로 쓸 수 있는지 실측 → (ok, detail).
+def _write_fail_detail(repo_id: str, e: Exception) -> str | None:
+    """쓰기 실패 예외 → 사람이 읽을 detail(용량 초과면 `HF_STORAGE_FULL:` 접두).
 
-    whoami 는 **읽기 전용 토큰도 통과시킨다**. 그래서 토큰이 멀쩡해 보이는데 체크포인트
-    push 에서야 401 이 나고, 그때는 이미 쿼터·업로드·원격 부팅을 다 낭비한 뒤다
-    (실측 2026-07-21: role=fineGrained 토큰이 whoami 통과 후 create_repo 에서 401).
+    반환 None = '쓰기 실패가 아님'(해당 안 됨). ★용량(403 storage limit)을 auth(401/403)보다
+    **먼저** 가린다 — 순서를 바꾸면 403 이 '토큰 확인' 으로 오분류된다(2026-10-31 헛짚음).
+    """
+    from . import hf_storage
+    if hf_storage.is_storage_full(e):
+        return (f"HF_STORAGE_FULL: 계정 저장소 한도 초과({repo_id}) — 토큰 문제가 아니라 저장 "
+                f"공간이 가득 참. `fcc ckpt squash {repo_id}` 로 고아 체크포인트를 청소하세요 "
+                f"(같은 계정의 다른 비공개 저장소도 한도를 함께 먹습니다). 원인: {str(e)[:80]}")
+    from .checkpoint import _is_auth_error
+    if _is_auth_error(e):
+        return (f"토큰에 쓰기 권한이 없습니다({repo_id}). HF 토큰을 **Write** 로 다시 발급하세요 "
+                f"— https://huggingface.co/settings/tokens 에서 'Create new token' → Write. "
+                f"(Fine-grained 를 쓰신다면 해당 저장소에 대한 write 권한 + 저장소 생성 권한이 "
+                f"필요합니다.) 그 뒤 `fcc login huggingface`.")
+    return f"저장소 확인 실패: {str(e)[:100]}"
 
-    role 문자열로 추측하지 않고 **실제로 필요한 연산(create_repo exist_ok)** 을 미리 한다.
-    멱등이고, 어차피 런이 시작하자마자 할 일이라 부작용이 없다.
+
+def verify_hf_write(repo_id: str, tok: str | None = None, *,
+                    hygiene: str = "warn", keep_revisions=()) -> tuple[bool, str]:
+    """`repo_id` 에 실제로 쓸 수 있는지 실측 → (ok, detail). 순서: ensure_repo → 위생 → 프로브.
+
+    whoami 는 **읽기 전용 토큰도 통과시킨다**. 또한 토큰이 멀쩡해도 **계정 저장소가 가득 차면**
+    push 에서 403 이 난다(2026-10-31). 그래서 (1) 저장소 생성(멱등)으로 권한을, (2) 정책별
+    위생으로 고아 누적을, (3) 임시 브랜치 쓰기 프로브로 '실제 쓰기 + 용량'을 미리 실측한다.
+    셋 다 어차피 런이 곧 할 일이라 부작용이 없다.
+
+    반환 detail 이 `HF_STORAGE_FULL:` 로 시작하면 용량 초과(호출부가 접두로 error_class 를 가른다).
+    `FCC_HF_PROBE=0` 이면 프로브를 생략(권한만 확인). hub 미설치는 통과.
     """
     try:
         from huggingface_hub import HfApi  # noqa: F401
     except ImportError:
         return True, "huggingface_hub 미설치 — 로컬 검증 생략."
+    from . import hf_storage
+
+    # (1) 저장소 존재/쓰기 권한(멱등 create_repo)
     try:
         from .checkpoint import Checkpoint
         Checkpoint(repo_id, token=tok).ensure_repo()
-        return True, f"쓰기 가능 확인: {repo_id}"
     except Exception as e:
-        from .checkpoint import _is_auth_error
-        if _is_auth_error(e):
-            return False, (
-                f"토큰에 쓰기 권한이 없습니다({repo_id}). HF 토큰을 **Write** 로 다시 발급하세요 "
-                f"— https://huggingface.co/settings/tokens 에서 'Create new token' → Write. "
-                f"(Fine-grained 를 쓰신다면 해당 저장소에 대한 write 권한 + 저장소 생성 권한이 "
-                f"필요합니다.) 그 뒤 `fcc login huggingface`.")
-        return False, f"저장소 확인 실패: {str(e)[:100]}"
+        return False, _write_fail_detail(repo_id, e)
+
+    # (2) 정책별 위생(auto 면 여기서 고아 삭제 — 프로브보다 **먼저**)
+    hyg = hf_storage.hygiene(repo_id, tok, policy=hygiene, keep_revisions=keep_revisions)
+
+    # (3) 실제 쓰기 + 용량 프로브(임시 브랜치)
+    if os.environ.get("FCC_HF_PROBE") == "0":
+        return True, f"쓰기 가능 확인(프로브 생략, FCC_HF_PROBE=0): {repo_id} | {hyg}"
+    try:
+        ok, detail = hf_storage.write_probe(repo_id, tok)
+    except Exception as e:
+        return False, _write_fail_detail(repo_id, e)
+    return True, f"{detail} | {hyg}"
 
 
 def _hf_whoami() -> AuthStatus:

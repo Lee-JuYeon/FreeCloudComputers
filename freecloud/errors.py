@@ -111,6 +111,16 @@ _PLAYBOOK: list[tuple[str, str, str, str, int]] = [
      "(약 1분, 브라우저) 후 재실행. kaggle CLI OAuth(credentials.json)는 별개로 자동 "
      "갱신된다 — 다시 할 필요 없음.", 0),
 
+    # ── HF 계정 저장소 한도 초과: **AUTH 바로 위**(403 이 AUTH 로 새지 않게) ──────
+    # 근본(2026-10-31): ckpt push 가 403 'private storage limit reached' 로 저장만 실패했는데,
+    # 그 403 이 AUTH 로 분류돼 "토큰 확인" 이라는 틀린 조언이 나갔다(헛짚음). 이건 토큰이 아니라
+    # 계정 저장소가 가득 찬 것 → 사람이 청소해야 한다(ABORT, 쿨다운 0). 페일오버해도 같은 계정
+    # 한도를 먹으므로 다른 provider 로 가도 소용없다.
+    (r"hf_storage_full|private storage limit|storage limit reached",
+     "HF_STORAGE_FULL", ABORT, "HF 계정 저장소 한도 초과(토큰 문제 아님). "
+     "고아 체크포인트를 청소하세요: `fcc ckpt squash <repo>`. "
+     "※ 같은 계정의 다른 비공개 저장소도 한도를 함께 먹는다.", 0),
+
     # ── 인증/설정: 페일오버해도 같은 결과 → 사람 개입 ────────────────────────
     (r"gated repo|401|403|unauthorized|invalid .*token|authentication|permission denied",
      "AUTH", ABORT, "인증 실패(토큰/gated repo). provider Secret·HF/Kaggle 토큰 확인 필요.", 0),
