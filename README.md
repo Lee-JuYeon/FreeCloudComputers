@@ -15,9 +15,17 @@ Kaggle 30h/주, Colab 15~30h/주, Lightning 80h/월, Modal $30/월 … 각각은
 ## 설치
 
 ```bash
+pip install freecloud              # CLI 코어 (PyPI)
+pip install 'freecloud[hub]'       # + 체크포인트 동기화(HF Hub) — 재개하려면 필요
+pip install 'freecloud[mcp]'       # + Claude/dev-hub 제어용 MCP 래퍼(선택)
+```
+
+소스에서(개발용)로 쓰려면:
+
+```bash
 pip install -e .            # CLI 코어
-pip install -e '.[hub]'     # + 체크포인트 동기화(HF Hub) — 재개하려면 필요
-pip install -e '.[mcp]'     # + Claude/dev-hub 제어용 MCP 래퍼(선택)
+pip install -e '.[hub]'     # + 체크포인트 동기화(HF Hub)
+pip install -e '.[mcp]'     # + MCP 래퍼(선택)
 ```
 
 ## 빠른 시작
