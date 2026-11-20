@@ -49,6 +49,12 @@ HEARTBEAT_S = 600
 #: 이 문자열이 status 에 있으면 커널이 아직 살아 있다(완료/오류 전).
 _ALIVE_MARKERS = ("running", "queued")
 
+#: `kaggle kernels status` 가 보고하는 **커널 수명 종단 상태어**(KernelWorkerStatus).
+#: 종단 판정은 오직 이 상태어로만 한다 — 출력 문자열에 우연히 섞인 'complete'/'error'
+#: (일시적 조회 실패 메시지·이전 버전 로그 등)에 속지 않기 위해서다(아래 _kernel_lifecycle).
+_COMPLETE_WORDS = ("complete",)
+_FAIL_WORDS = ("error",)
+
 #: stale-kernel 가드(2026-10-16 수리). push 가 rc=0 이어도 새 세션을 못 띄우면
 #: (쿼터 소진 시 재발, 10-08·10-16) 폴링이 옛 COMPLETE 를 성공으로 읽는다.
 #: push 전후로 lastRunTime/status 변화를 최대 이 시간(초)만큼 폴링해 확인한다.
@@ -445,6 +451,33 @@ class KaggleProvider(Provider):
         word = m.group(1) if m else (st or "").strip()[-60:]
         return word.rsplit(".", 1)[-1].lower() or "?"
 
+    @classmethod
+    def _kernel_lifecycle(cls, rc: int, st: str) -> str:
+        """status 조회 (rc, 출력) → 커널 수명 상태: 'complete'|'error'|'alive'|'unknown'.
+
+        근본(2026-11-21 수리): 예전엔 `"complete" in low` / `"error" in low` 로 **raw 출력을
+        부분문자열 스캔**해 종단을 판정했다. 그래서 (1) status 조회 자체가 일시적으로 실패
+        (rc!=0, 네트워크/5xx — 출력에 'error' 포함)하거나 (2) 실행 중 커널의 상태 출력에
+        'error' 문자열이 우연히 섞이면, **살아 있는(또는 push로 commit된) 커널을 종단 미분류
+        실패로 떨어뜨리고** 오케스트레이터가 포기했다(커널은 Kaggle 에서 끝까지 돌아 HF 에 push).
+
+        고침: 종단은 오직 **파싱된 상태어**(KernelWorkerStatus)로만 판정한다.
+          · rc!=0 → 'unknown'(조회 실패 = 일시적, 커널 상태 미상. 종단 아님 → 계속 폴링).
+          · 상태어 complete/error → 종단. 그 외(running/queued/미상 상태어) → 종단 아님.
+        이로써 'running-but-uncommitted'(push로 떠서 돌지만 UI 커밋은 skip된 커널)와
+        terminal-fail(KernelWorkerStatus.ERROR)이 분리된다.
+        """
+        if rc != 0:
+            return "unknown"
+        word = cls._status_word(st)
+        if word in _COMPLETE_WORDS:
+            return "complete"
+        if word in _FAIL_WORDS:
+            return "error"
+        if word in _ALIVE_MARKERS:
+            return "alive"
+        return "unknown"
+
     def _heartbeat(self, job: Job, kid: str, elapsed: float, st: str) -> None:
         """폴링 생존 신호 한 줄. checkpoint_repo 가 있으면 최신 커밋 제목도 붙인다."""
         line = (f"[{self.name}] ♥ {int(elapsed) // 60}분 경과 · kernel={kid} "
@@ -493,12 +526,14 @@ class KaggleProvider(Provider):
         while time.time() < deadline:
             time.sleep(60)
             rc, st = self._sh(["kaggle", "kernels", "status", kid], 60, _UTF8)
-            low = st.lower()
             now = time.time()
             if now - last_hb >= HEARTBEAT_S:
                 self._heartbeat(job, kid, now - start, st)
                 last_hb = now
-            if "complete" in low:
+            # 종단 판정은 파싱된 상태어로만(설계: terminal-fail vs running-but-uncommitted).
+            # rc!=0(조회 실패) 또는 running/queued/미상 상태어 → 종단 아님 → 계속 폴링.
+            kstate = self._kernel_lifecycle(rc, st)
+            if kstate == "complete":
                 adir, diag = self.fetch_outputs(job, kid)
                 got = self.assigned_gpu(diag)
                 want = job.needs.get("gpu")
@@ -520,7 +555,7 @@ class KaggleProvider(Provider):
                 return RunResult(True, "done",
                                  f"Kaggle 완료(GPU={got or '?'}). 산출물 → {adir}",
                                  st[-400:], "", adir)
-            if "error" in low:
+            if kstate == "error":
                 adir, diag = self.fetch_outputs(job, kid)
                 d = classify(st + "\n" + diag)
                 return RunResult(False, "error", d.advice, (diag or st)[-1200:],
