@@ -26,6 +26,7 @@ pip install -e '.[mcp]'     # + Claude/dev-hub 제어용 MCP 래퍼(선택)
 freecloud clouds              # 지원/후보 무료 클라우드 카탈로그
 freecloud login huggingface   # 체크포인트 저장소 토큰(재개에 필요) — 자세히는 docs/AUTH.md
 freecloud login kaggle        # 사이트별 로그인은 처음 한 번만
+freecloud login               # (인자 없음) 상태표 + 미인증인 것만 차례로 묻는다
 freecloud auth                # 인증 상태 한눈에(계정/토큰/세션)
 freecloud providers           # 각 provider 가용 상태
 freecloud run examples/job.yaml
@@ -186,9 +187,11 @@ job.yaml ─► orchestrator ─► [provider 순회: probe→run→성공?]
 
 → `examples/train_lora.py`가 최소 형태. transformers/peft로 바꿔도 구조는 동일.
 
-## 지원 & 후보 클라우드 (2026-07, 비중국)
+## 지원 & 후보 컴퓨트 (2026-07, 비중국)
 
-`freecloud clouds` 출력과 동일. 값은 변동 — 갱신 PR 환영.
+`freecloud clouds` 출력과 동일 — 자원 종류별 섹션(GPU/Computer/Mobile) + Lab. 값은 변동, 갱신 PR 환영.
+
+**GPU — 가속기 대여**
 
 | | 클라우드 | 무료 GPU | 한도 | 카드 |
 |---|---|---|---|---|
@@ -202,8 +205,22 @@ job.yaml ─► orchestrator ─► [provider 순회: probe→run→성공?]
 | · | HF Spaces ZeroGPU | H200(버스트) | ~5분/일 (데모용) | X |
 | · | Paperspace(DO) | M4000 8GB | 6h | X |
 | · | Google TRC | TPU 1000+대 | 신청제(오픈소스 조건) | GCP |
-| ⚙ | Oracle Always Free | ARM A1 | 영구(컨트롤 플레인) | 필요 |
-| ⚙ | GitHub Actions | CPU | 2000분/월(디스패처) | X |
+
+**Computer — 범용 컴퓨트**
+
+| | 클라우드 | 스펙 | 한도 | 카드 |
+|---|---|---|---|---|
+| · | Oracle Always Free | ARM A1 4코어/24GB | 영구 무료 | 필요 |
+| · | GitHub Actions | CPU 러너 | 2000분/월(디스패처) | X |
+
+**Mobile — 모바일 기기**: (등록 항목 없음 — 후보 PR 환영)
+
+**Lab — 시뮬 런타임**
+
+| 이름 | 요구 HW | 무료풀 구동 | 비고 |
+|---|---|---|---|
+| MJX+Brax | 비RTX GPU | 가능 | 채택 런타임(MuJoCo MJX 헤드리스) |
+| Isaac Lab | RTX 4080+ | 불가 | 무료 풀 구동 불가 — 기존 탈락 결정 |
 
 ### Kaggle T4×2 — provider `kaggle-ui` (Playwright 자동화)
 Kaggle **API/CLI는 단일 GPU(P100)만** 노출한다. **T4×2는 웹 UI 전용**(Settings→Accelerator→
@@ -229,6 +246,9 @@ freecloud kaggle-login          # 최초 1회: 브라우저 로그인(2FA 포함
 > Viewer(→Copy&Edit) ④세션 running 중(→Stop).
 
 ### Lightning AI — provider `lightning` (lightning-sdk Job)
+
+`fcc login lightning` 으로 API Key·User ID·Teamspace 3종을 저장해 두면 아래 `LIGHTNING_*`
+3개는 export 할 필요가 없다(환경변수가 있으면 그쪽이 우선).
 
 ```bash
 pip install lightning-sdk
@@ -269,21 +289,25 @@ colab/lightning/modal/saturn 은 `warn_unfetched` 로 "회수 못 한다"고 말
 
 Apache-2.0
 
-### Kaggle 인증 (CLI 2.2+ 에서 바뀌었다)
-
-`kaggle` CLI 2.2.x 부터 인증 방식이 바뀌어 **예전 `~/.kaggle/kaggle.json`
-(username+key) 만으로는 통과하지 않는다.** 파일이 있어도 `Authentication required`
-로 거절된다(2026-08-21 실측: `kaggle.json`·`access_token` 이 둘 다 있는 머신에서도 거절).
+### Kaggle 인증 — `fcc login kaggle` 한 줄
 
 ```bash
-kaggle auth login          # 권장 — 브라우저 OAuth, 1회
+fcc login kaggle           # 브라우저 OAuth 1회 → 끝나면 실제 API 호출로 통과 여부를 확인
 ```
 
-> **알아둘 것**: `kaggle auth login` 은 `~/.kaggle/credentials.json` 을 만들지만
-> **CLI 2.2.x 는 이 파일을 `kernels` 계열 명령에서 자동으로 읽지 않는다.**
-> 로그인 직후에도 `Authentication required` 가 뜬다(2026-08-21 실측, CLI 2.2.4에서도 동일).
-> `freecloud` 는 이 파일의 `access_token` 을 `KAGGLE_API_TOKEN` 으로 자동 주입해 메운다 —
-> 사용자가 손으로 export 할 필요 없다.
+이 한 줄이 `kaggle auth login --force` 를 돌리고, 끝나면 probe 로 판정해 실패 시 rc=1 을 낸다.
+
+> **낡은 `~/.kaggle/kaggle.json` 이 OAuth 를 가린다.** `kaggle auth login` 이 만드는
+> `~/.kaggle/credentials.json` 은 CLI 가 정상적으로 읽는다(실측: `credentials.json` 만 있으면
+> rc=0). 그런데 예전 `kaggle.json`(username+key)이 같이 있으면 인증 순서상 그쪽이 앞이라,
+> 그 키가 낡았을 때 로그인 직후에도 `Authentication required` 가 난다(같은 조건에
+> `kaggle.json` 을 더하면 rc=1). 예전 문서의 "CLI 가 `credentials.json` 을 안 읽는다"는 오진이었다.
+>
+> 그래서 `fcc login kaggle` 은 시작할 때 `kaggle.json` 이 있으면 **`.bak` 으로 바꿀지 항상
+> 묻는다.** `access_token`·`access_token.txt` 는 **지금 인증이 실패하고 있을 때만** 묻는다
+> (통과 중이면 유효한 토큰일 수 있다). 지우지 않고 이름만 바꾸며, 비대화형에서는 건드리지 않고
+> 경고만 한다. 또 fcc 는 kaggle CLI 를 부를 때 토큰을 `KAGGLE_API_TOKEN` 으로 주입한다 —
+> 순서는 **환경변수 > OAuth(`credentials.json`) > `fcc` 에 저장한 토큰**.
 
 #### access token 수명은 3시간 — fcc 가 자동으로 갱신한다
 
@@ -296,18 +320,18 @@ kaggle auth login          # 권장 — 브라우저 OAuth, 1회
 갱신이 실패하면(=refresh_token 도 만료) 재로그인이 필요하다:
 
 ```bash
-kaggle auth login --force     # ★ --force 필수
+fcc login kaggle              # 내부에서 --force 를 붙인다
 ```
 
-> `--force` 없이 `kaggle auth login` 을 치면 CLI 가 **만료된 토큰을 보고도 "이미 로그인됨"
+> `--force` 없이 `kaggle auth login` 을 직접 치면 CLI 가 **만료된 토큰을 보고도 "이미 로그인됨"
 > 이라 답하고 그냥 끝난다.** 그래서 아무리 다시 쳐도 인증이 안 풀리는 것처럼 보인다.
 
 비대화형(CI 등)이면 [kaggle.com/settings/api](https://www.kaggle.com/settings/api) 에서
-새 토큰을 발급해 둘 중 하나로 넣는다:
+새 토큰을 발급해 환경변수로 넘긴다. 실제 API 호출로 검증된 뒤에만 `~/.freecloud/secrets.json`
+에 저장된다:
 
 ```bash
-export KAGGLE_API_TOKEN=xxxxxxxx      # A) 환경변수
-echo "xxxxxxxx" > ~/.kaggle/access_token   # B) 파일
+KAGGLE_API_TOKEN=xxxxxxxx fcc login kaggle
 ```
 
 `fcc auth` 는 이제 **실제 API 호출 결과까지 확인**한다. 예전에는 CLI 존재 여부만 보고
