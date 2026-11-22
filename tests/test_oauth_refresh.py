@@ -92,14 +92,14 @@ def test_refresh_exception_returns_empty_with_hint(tmp_path, monkeypatch, capsys
         raise RuntimeError("network down")
     monkeypatch.setattr(K, "_refresh_via_sdk", boom)
     assert K.oauth_access_token() == ""
-    assert "auth login --force" in capsys.readouterr().out
+    assert "fcc login kaggle" in capsys.readouterr().out
 
 
 def test_refresh_empty_token_returns_empty(tmp_path, monkeypatch, capsys):
     _creds(tmp_path, monkeypatch, exp_delta_s=-10)
     monkeypatch.setattr(K, "_refresh_via_sdk", lambda rt: ("", ""))
     assert K.oauth_access_token() == ""
-    assert "auth login --force" in capsys.readouterr().out
+    assert "fcc login kaggle" in capsys.readouterr().out
 
 
 # ── (d) kagglesdk 없음 → "" (옛 동작) ───────────────────────────────────────

@@ -4,14 +4,15 @@
   · 토큰 방식(huggingface/kaggle/lightning/modal/saturn) — 붙여넣기/CLI 1회 → 저장소.
   · 브라우저 방식(colab/kaggle-ui) — headful 로그인 1회 → 쿠키(storage_state) 저장 → 재사용.
 
-각 provider의 로그인 핸들러 + 상태 체크를 여기 모아 CLI가 호출.
+provider 별 차이(항목·저장 위치·획득 방법·검증·선행 요구)는 creds.py 의 AuthSpec 선언에 있고,
+로그인 절차는 creds.login 엔진 하나다. 여기는 CLI 가 부르는 얇은 표면 + 대화형 가드 + HF 검증.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
 
-from . import secrets
+from . import creds, secrets
 
 
 @dataclass
@@ -19,6 +20,7 @@ class AuthStatus:
     provider: str
     ok: bool
     detail: str
+    error_class: str = ""       # "NOT_INSTALLED" = 로그인으로 못 푼다(설치가 먼저)
 
 
 # ── 상태 체크 ────────────────────────────────────────────────────────────────
@@ -111,16 +113,8 @@ def _hf_whoami() -> AuthStatus:
 
 
 def status_all() -> list[AuthStatus]:
-    out = [_hf_whoami()]
-    # provider들의 자체 probe를 인증 상태로 재사용
-    from . import registry
-    for name in registry.available_names():
-        try:
-            pr = registry.get(name).probe()
-            out.append(AuthStatus(name, pr.available, pr.reason))
-        except Exception as e:
-            out.append(AuthStatus(name, False, str(e)[:80]))
-    return out
+    """등록된 Spec 전부의 인증 상태(creds.status_table)."""
+    return [AuthStatus(*row) for row in creds.status_table()]
 
 
 # ── 대화형 가드 ──────────────────────────────────────────────────────────────
@@ -133,6 +127,11 @@ def _require_interactive(what: str, env_hint: str = "") -> None:
     """
     if interactive_available():
         return
+    _noninteractive_exit(what, env_hint)
+
+
+def _noninteractive_exit(what: str, env_hint: str = "") -> None:
+    """입력이 필요한데 대화형이 아닐 때의 종료(안내 포함). 항상 SystemExit."""
     lines = [
         f"[freecloud] '{what}'에는 터미널 입력이 필요한데, 지금 stdin이 TTY가 아닙니다"
         f"(파이프·에이전트·CI).",
@@ -164,14 +163,6 @@ def _warn_if_env_shadows(name: str, stored: str) -> None:
     print()
 
 
-def _from_env(*names: str) -> str | None:
-    for n in names:
-        v = os.environ.get(n)
-        if v:
-            return v.strip()
-    return None
-
-
 # ── 로그인 핸들러 ────────────────────────────────────────────────────────────
 def _mirror_hf_cache(tok: str) -> str | None:
     """표준 HF 캐시(~/.cache/huggingface/token)에도 미러.
@@ -196,137 +187,29 @@ def _mirror_hf_cache(tok: str) -> str | None:
 
 
 def login_huggingface() -> None:
-    """write 토큰을 붙여넣기 받아 whoami로 검증 후 저장 + 표준 HF 캐시에 미러."""
-    # env에 있으면 먼저 시도(무인 경로). ⚠️ 단, 만료·무효면 여기서 끝내지 않는다 —
-    #    그러면 만료 토큰이 env에 남아있는 사람은 새 토큰을 넣을 기회조차 없다(실측).
-    tok = _from_env("HF_TOKEN", "HUGGINGFACE_TOKEN")
-    if tok:
-        ok, detail = verify_hf_token(tok)
-        if ok:
-            secrets.set("HF_TOKEN", tok)
-            _mirror_hf_cache(tok)
-            print(f"env 토큰이 유효합니다 — 저장 완료. {detail}")
-            return
-        print(f"env 의 HF 토큰이 무효합니다: {detail}")
-        print("→ 새 토큰을 입력받겠습니다.")
-        tok = None
-
-    if not tok:
-        _require_interactive("HF 토큰 입력", "HF_TOKEN=hf_xxx fcc login huggingface")
-        print("HF write 토큰을 발급하세요: https://huggingface.co/settings/tokens (Type: Write)")
-        tok = _prompt_secret("HF 토큰 붙여넣기: ")
-    if not tok:
-        print("취소됨."); return
-    ok, detail = verify_hf_token(tok)
-    if not ok:
-        print(f"토큰 검증 실패(저장 안 함): {detail}"); return
-    secrets.set("HF_TOKEN", tok)
-    _warn_if_env_shadows("HF_TOKEN", tok)
-    if _mirror_hf_cache(tok):
-        print("표준 HF 캐시(~/.cache/huggingface/token)에도 미러 — 외부 런처도 이 토큰 사용.")
-    print(f"저장 완료 — {detail}")
-
-
-def login_kaggle() -> None:
-    """kaggle 인증 안내.
-
-    ⚠️ kaggle CLI 2.2.x 부터 인증이 바뀌었다. 예전 ~/.kaggle/kaggle.json
-    (username+key)만으로는 "Authentication required" 로 거절당한다.
-    실측(2026-08-21): kaggle.json·access_token 이 둘 다 있는 머신에서도 거절.
-    → 권장: `kaggle auth login` (브라우저 OAuth, 토큰 자동 캐시)
-       비대화형: kaggle.com/settings/api 새 토큰 → KAGGLE_API_TOKEN 또는
-                 ~/.kaggle/access_token
-    """
-    print("Kaggle 인증(CLI 2.2+):")
-    print("  1) 권장  : kaggle auth login       # 브라우저 OAuth, 1회")
-    print("  2) 비대화: kaggle.com/settings/api → 토큰 발급 →")
-    print("             export KAGGLE_API_TOKEN=... 또는 ~/.kaggle/access_token 에 저장")
-    print("  ※ 예전 kaggle.json(username+key)만으로는 통과하지 않는다.")
-    kj = os.path.expanduser("~/.kaggle/kaggle.json")
-    if os.path.exists(kj):
-        print(f"이미 있음: {kj} — 그대로 사용됩니다.")
-        return
-    user = _from_env("KAGGLE_USERNAME")
-    key = _from_env("KAGGLE_KEY")
-    if not (user and key):
-        _require_interactive("Kaggle username/key 입력",
-                             "KAGGLE_USERNAME=... KAGGLE_KEY=... fcc login kaggle")
-        print("Kaggle 토큰: kaggle.com → Settings → API → 'Create New Token' → kaggle.json 다운로드")
-        print(f"그 파일을 {kj} 에 두거나, 아래에 username/key를 입력하세요.")
-        user = input("KAGGLE_USERNAME: ").strip()
-        key = _prompt_secret("KAGGLE_KEY: ")
-    if user and key:
-        os.makedirs(os.path.dirname(kj), exist_ok=True)
-        import json
-        with open(kj, "w", encoding="utf-8") as f:
-            json.dump({"username": user, "key": key}, f)
-        try:
-            os.chmod(kj, 0o600)
-        except Exception:
-            pass
-        print(f"저장 완료 → {kj}")
-
-
-def login_modal() -> None:
-    print("Modal 인증: 브라우저가 열립니다(최초 1회).")
-    os.system("modal token new")
+    """write 토큰을 env/붙여넣기로 받아 whoami 로 검증 후 저장 + 표준 HF 캐시에 미러."""
+    _report(creds.login("huggingface"))
 
 
 def login_lightning() -> None:
-    key = _from_env("LIGHTNING_API_KEY")
-    if not key:
-        _require_interactive("Lightning API key 입력",
-                             "LIGHTNING_API_KEY=... fcc login lightning")
-        print("Lightning: lightning.ai → Settings 에서 User ID / API Key 발급 후 env로 설정:")
-        print("  export LIGHTNING_USER_ID=... LIGHTNING_API_KEY=... LIGHTNING_TEAMSPACE=you/space")
-        key = _prompt_secret("LIGHTNING_API_KEY(저장하려면 붙여넣기, 건너뛰려면 Enter): ")
-    if key:
-        secrets.set("LIGHTNING_API_KEY", key)
-        print("저장됨. USER_ID/TEAMSPACE는 env로 설정하세요.")
+    """LIGHTNING_API_KEY·LIGHTNING_USER_ID·LIGHTNING_TEAMSPACE 3종을 받아 저장."""
+    _report(creds.login("lightning"))
 
 
 def login_saturn() -> None:
-    tok = _from_env("SATURN_TOKEN")
-    if not tok:
-        _require_interactive("Saturn 토큰 입력", "SATURN_TOKEN=... fcc login saturn")
-        print("Saturn Cloud: app.community.saturnenterprise.io → Settings 에서 User Token 발급.")
-        tok = _prompt_secret("SATURN_TOKEN 붙여넣기: ")
-    if tok:
-        secrets.set("SATURN_TOKEN", tok)
-        print("저장됨.")
+    _report(creds.login("saturn"))
 
 
-def login_browser(provider: str) -> None:
-    """colab/kaggle-ui — Playwright headful 로그인 → storage_state 저장."""
-    if provider in ("kaggle-ui", "kaggle"):
-        from .providers.kaggle_ui import save_login_state
-        save_login_state()
-        return
-    if provider == "colab":
-        from .providers.colab_login import save_login_state as colab_save
-        colab_save()
-        return
-    print(f"'{provider}' 브라우저 로그인 핸들러 없음.")
+def _report(result: tuple[bool, str]) -> None:
+    """반환값을 버리는 래퍼용 — 엔진은 실패 사유를 찍지 않으므로 여기서 한 번 찍는다."""
+    ok, detail = result
+    if not ok:
+        print(detail)
 
 
-_HANDLERS = {
-    "huggingface": login_huggingface,
-    "hf": login_huggingface,
-    "kaggle": login_kaggle,
-    "kaggle-ui": lambda: login_browser("kaggle-ui"),
-    "colab": lambda: login_browser("colab"),
-    "modal": login_modal,
-    "lightning": login_lightning,
-    "saturn": login_saturn,
-}
-
-
-def login(provider: str) -> None:
-    fn = _HANDLERS.get(provider)
-    if not fn:
-        print(f"알 수 없는 provider '{provider}'. 가능: {sorted(_HANDLERS)}")
-        return
-    fn()
+def login(provider: str, interactive: bool | None = None) -> tuple[bool, str]:
+    """`fcc login <provider>` — creds 엔진에 위임. 반환 (ok, detail)."""
+    return creds.login(provider, interactive)
 
 
 def interactive_available() -> bool:
@@ -342,7 +225,7 @@ def ensure_for_job(job, order, interactive: bool = True) -> None:
     """Cloudflare CLI 스타일 온디맨드 인증 — 실행 전에 필요한 로그인을 그 자리에서 유도.
 
     - job.checkpoint_repo 있으면 HF 토큰 유효성 확인 → 없/무효면 즉석 로그인.
-    - 시도할 provider들이 미인증이면 지금 로그인할지 물어봄.
+    - 시도할 provider들이 미인증이면 지금 로그인할지 물어봄(creds.login — 선행 요구 자동 연쇄).
     비대화형(CI)에선 경고만 출력하고 진행.
     """
     can = interactive and interactive_available()
@@ -365,10 +248,12 @@ def ensure_for_job(job, order, interactive: bool = True) -> None:
         pr = prov.probe()
         if pr.available:
             continue
-        if can and name in _HANDLERS:
+        if can and creds.get_spec(name) is not None:
             ans = input(f"\n▶ [{name}] 사용불가: {pr.reason}\n  지금 로그인/설정할까요? [y/N] ").strip().lower()
             if ans == "y":
-                login(name)
+                # 선행 요구(예: kaggle-ui → kaggle)는 엔진이 알아서 먼저 처리한다.
+                ok, detail = creds.login(name)
+                print(f"  → [{name}] {'OK' if ok else '실패'}: {detail}")
         else:
             print(f"⚠ [{name}] {pr.reason} (스킵됨)")
 

@@ -71,9 +71,9 @@ def names() -> list[str]:
     """저장소 + 관련 env에 존재하는 시크릿 이름(값은 노출 안 함).
 
     주의: 이 모듈은 set()을 함수로 재정의하므로 빌트인 set을 쓰지 않는다(dict로 dedup)."""
+    from . import creds   # 지연 import — creds 가 이 모듈을 import 한다(순환 방지)
     have: dict[str, bool] = {k: True for k in _load().keys()}   # 저장소
-    for k in CKPT_SECRETS + ["KAGGLE_KEY", "LIGHTNING_API_KEY", "MODAL_TOKEN_SECRET",
-                             "SATURN_TOKEN"]:
+    for k in creds.known_secret_names():    # 이름 목록은 AuthSpec 선언에서 유도(하드코딩 금지)
         if os.environ.get(k):
             have[k] = True
     return sorted(have.keys())

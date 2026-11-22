@@ -289,7 +289,8 @@ class KaggleUIProvider(KaggleProvider):
         if not base.available:
             return base
         if self._pw() is None:
-            return Probe(False, "playwright 미설치(pip install 'freecloud[kaggle-ui]' && playwright install chromium).")
+            return Probe(False, "playwright 미설치(pip install 'freecloud[kaggle-ui]' && playwright install chromium).",
+                         error_class="NOT_INSTALLED")
         # ⚠️ 파일 존재만 보면 '익명/만료 세션'이 통과해 실패가 LOGIN_REQUIRED 가 아닌
         #    UI_AUTOMATION 으로 오분류된다(2026-07-20·10-24 실측). session_is_logged_in 이
         #    쿠키 만료(14일)까지 본다(browser_login_status 를 감싼 것 — 호출부 무변경).

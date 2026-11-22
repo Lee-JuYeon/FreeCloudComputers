@@ -5,6 +5,7 @@
   freecloud providers            # 등록된 provider + probe 상태
   freecloud status               # 쿨다운 스냅샷
   freecloud clouds               # 지원/후보 무료 클라우드 카탈로그
+  freecloud login [provider]     # 로그인(생략 시 상태표 + 미인증만 차례로)
 """
 from __future__ import annotations
 
@@ -103,7 +104,7 @@ def _cmd_logs(args) -> int:
     job = _job_for_logs(args.job)
     prov = KaggleProvider()
     if not prov._user():
-        print("Kaggle 인증 없음 — `kaggle auth login` 후 다시 시도하세요.")
+        print("Kaggle 인증 없음 — `fcc login kaggle` 후 다시 시도하세요.")
         return 1
     kid = prov.kernel_id(job)
     print(f"kernel: {kid}")
@@ -247,19 +248,65 @@ def _cmd_ckpt_squash(args) -> int:
     return 0
 
 
+def _not_installed(error_class: str) -> bool:
+    from . import creds
+    return error_class == creds.NOT_INSTALLED
+
+
+def _print_auth_table(rows) -> None:
+    """OK / --(미인증) / ··(미설치 — 로그인으로 못 푼다, detail 에 설치 명령)."""
+    for s in rows:
+        mark = "OK " if s.ok else ("·· " if _not_installed(s.error_class) else "-- ")
+        print(f"{mark}{s.provider:12} {s.detail}")
+
+
 def _cmd_login(args) -> int:
-    """freecloud login <provider> — 사이트별 최초 1회 로그인/토큰 등록."""
+    """freecloud login [provider] — 로그인/토큰 등록. 실패하면 rc=1.
+
+    provider 를 생략하면 전체 상태표를 찍고 **실패한 것만** 차례로 묻는다(kaggle-ui·colab 포함).
+    비TTY 에서는 표만 찍고 한 번도 묻지 않는다 — 실패가 있으면 rc=1.
+    **미설치**(CLI/SDK 없음)는 로그인으로 풀 수 없으므로 따로 표시만 하고 묻지도, rc 에 세지도 않는다.
+    """
     from . import auth
-    auth.login(args.provider)
-    return 0
+    if args.provider:
+        ok, detail = auth.login(args.provider)
+        print(f"{'OK ' if ok else '-- '}{args.provider:12} {detail}")
+        return 0 if ok else 1
+
+    rows = auth.status_all()
+    _print_auth_table(rows)
+    missing = [s.provider for s in rows if not s.ok and _not_installed(s.error_class)]
+    failed = [s.provider for s in rows if not s.ok and not _not_installed(s.error_class)]
+    if missing:
+        print(f"\n미설치(쓰려면 위 설치 명령 먼저): {', '.join(missing)}")
+    if not failed:
+        return 0
+    if not auth.interactive_available():
+        print(f"\n미인증: {', '.join(failed)} — 터미널에서 `fcc login` 또는 `fcc login <provider>`.")
+        return 1
+    from . import creds
+    still = []
+    for name in failed:
+        # 앞선 로그인이 선행 요구를 풀어 줬을 수 있다(kaggle → kaggle-ui) — 다시 본다.
+        ok, detail, ec = creds.probe_full(name)
+        if not ok and _not_installed(ec):
+            continue        # 선행 로그인 뒤에 드러난 미설치 — 물어도 못 푼다
+        if not ok:
+            ans = input(f"\n▶ [{name}] {detail}\n  지금 로그인할까요? [y/N] ").strip().lower()
+            if ans == "y":
+                ok, detail = auth.login(name)
+                print(f"{'OK ' if ok else '-- '}{name:12} {detail}")
+        if not ok:
+            still.append(name)
+    if still:
+        print(f"\n아직 미인증: {', '.join(still)}")
+    return 1 if still else 0
 
 
 def _cmd_auth(args) -> int:
     """freecloud auth — 모든 인증 상태(계정/토큰/세션) 한눈에."""
     from . import auth, secrets
-    for s in auth.status_all():
-        mark = "OK " if s.ok else "-- "
-        print(f"{mark}{s.provider:12} {s.detail}")
+    _print_auth_table(auth.status_all())
     stored = secrets.names()
     if stored:
         print("\n저장된 시크릿(이름만):", ", ".join(stored))
@@ -327,7 +374,9 @@ def main(argv=None) -> int:
     cksq.set_defaults(fn=_cmd_ckpt_squash)
 
     lg = sub.add_parser("login", help="provider 로그인/토큰 등록(1회)")
-    lg.add_argument("provider", help="huggingface|kaggle|colab|modal|lightning|saturn|kaggle-ui")
+    lg.add_argument("provider", nargs="?",
+                    help="huggingface|kaggle|colab|modal|lightning|saturn|kaggle-ui "
+                         "(생략하면 상태표를 보여주고 미인증만 차례로 묻는다)")
     lg.set_defaults(fn=_cmd_login)
 
     sub.add_parser("auth", help="인증 상태 한눈에").set_defaults(fn=_cmd_auth)

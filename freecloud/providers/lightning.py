@@ -3,6 +3,8 @@
 Lightning 무료: 15크레딧/월 ≈ 80 GPU-h(interruptible). 페일오버 풀에서 물량이 가장 큰 축.
 
 인증(토큰 방식, 비대화형): env LIGHTNING_USER_ID + LIGHTNING_API_KEY (SDK 가 env 에서 읽는다).
+    `fcc login lightning` 이 3종을 secrets.json 에 저장하고, probe/run 첫머리의
+    creds.export_env("lightning") 가 그걸 env 로 올린다(이미 있는 env 가 우선).
 teamspace: env LIGHTNING_TEAMSPACE = "owner/teamspace" 슬러그(예: "lee-juyeon/default-project").
     → `teamspace=<슬러그>` 하나로 넘긴다. `user=`/`org=` 는 SDK 에서 deprecated 이고,
       과거 코드처럼 36자 user **id** 를 `user=` 에 넣으면 owner 해석이 틀어진다.
@@ -44,6 +46,7 @@ import os
 import re
 import time
 
+from .. import creds
 from ..job import Job
 from ..errors import classify
 from .base import Provider, Probe, RunResult
@@ -84,8 +87,10 @@ class LightningProvider(Provider):
             return None
 
     def probe(self) -> Probe:
+        creds.export_env(self.name)      # secrets.json → env(setdefault). SDK 는 env 만 읽는다.
         if self._sdk() is None:
-            return Probe(False, "lightning-sdk 미설치(pip install lightning-sdk).")
+            return Probe(False, "lightning-sdk 미설치(pip install lightning-sdk).",
+                         error_class="NOT_INSTALLED")
         if not (os.environ.get("LIGHTNING_API_KEY") and os.environ.get("LIGHTNING_USER_ID")):
             return Probe(False, "LIGHTNING_API_KEY/LIGHTNING_USER_ID 미설정.")
         if not os.environ.get("LIGHTNING_TEAMSPACE"):
@@ -94,6 +99,7 @@ class LightningProvider(Provider):
         return Probe(True, "lightning 인증 OK.")
 
     def run(self, job: Job) -> RunResult:
+        creds.export_env(self.name)
         sdk = self._sdk()
         if sdk is None:
             return RunResult(False, "error", "lightning-sdk 미설치.", error_class="JOB_CONFIG")

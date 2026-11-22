@@ -1,21 +1,38 @@
 # 인증 & 토큰 (로그인은 사이트별 딱 한 번)
 
-로그인은 **두 종류뿐**입니다.
+로그인은 **세 종류**입니다.
 
-## ① 토큰 방식 (붙여넣기 1회 → 무인)
-`huggingface`, `kaggle`, `modal`, `lightning`, `saturn`
+## ① 붙여넣기 방식 (토큰 1회 등록 → 무인)
+`huggingface`, `lightning`, `saturn`
 
-사이트에서 토큰을 발급받아 한 번 등록하면 끝. 이후 자동.
+사이트에서 토큰을 발급받아 한 번 등록하면 끝. 이후 자동. 값은 `~/.freecloud/secrets.json` 에
+저장됩니다. 필요한 값이 모두 환경변수에 있고 검증을 통과하면 묻지 않고 그 값을 저장합니다(무인 경로). 일부만 있으면 없는 항목만 묻고, 값이 무효면 새 값을 묻습니다.
 
 ```bash
 freecloud login huggingface   # write 토큰 붙여넣기 → whoami로 검증 후 저장
-freecloud login kaggle        # kaggle.json 안내 또는 username/key 입력
-freecloud login modal         # 'modal token new'(브라우저 1회) 실행
-freecloud login lightning     # API Key 저장 + env 안내
+freecloud login lightning     # API Key·User ID·Teamspace 3종 → 검증 후 저장
 freecloud login saturn        # User Token 저장
 ```
 
-## ② 브라우저 방식 (구글 로그인 등, headful 1회 → 쿠키 재사용)
+## ② 공식 CLI 브라우저 로그인 (그 도구의 로그인 명령 1회)
+`kaggle`, `modal`
+
+fcc 가 그 도구의 로그인 명령을 대신 돌리고, 끝나면 실제 API 호출로 통과 여부를 확인합니다.
+자격증명은 그 도구 자체 저장소(`~/.kaggle/credentials.json`, modal 설정)에 남습니다.
+
+```bash
+freecloud login kaggle        # 브라우저 OAuth 1회 → API 호출로 통과 확인(낡은 kaggle.json 은 OAuth 를 가리므로 .bak 으로 치울지 묻는다)
+freecloud login modal         # 'modal token new'(브라우저 1회) 실행 → 통과 확인
+```
+
+비대화형(CI·파이프)에서는 브라우저를 못 띄우므로 환경변수로 넘깁니다.
+
+```bash
+KAGGLE_API_TOKEN=... freecloud login kaggle    # 실제 API 호출로 검증된 뒤에만 secrets.json 에 저장
+MODAL_TOKEN_ID=... MODAL_TOKEN_SECRET=... freecloud login modal   # 확인만 하고 저장하지 않음(modal 이 env 를 직접 읽는다)
+```
+
+## ③ 브라우저 쿠키 방식 (구글 로그인 등, headful 1회 → 쿠키 재사용)
 `colab`, `kaggle-ui`(T4×2)
 
 구글 OAuth/2FA는 **자동화 불가·금지**(계정 잠금·ToS 위반). 그래서 사람이 최초 1회
@@ -38,13 +55,20 @@ freecloud login kaggle-ui     # 브라우저 뜸 → Kaggle 로그인 → ~/.fre
 > **LOGIN_REQUIRED**(ABORT)로 즉시 끝냅니다 — 페일오버·재시도로 쿼터를 태우지 않습니다.
 > 조치는 `freecloud kaggle-login` 한 번(약 1분, 브라우저). ⚠️ 과거 버전은 수명 30일인
 > `CLIENT-TOKEN`(JWT)만 봐서 16일 된 세션을 "로그인됨"으로 통과시켜 런타임에 404로 죽었습니다.
-> kaggle CLI OAuth(`~/.kaggle/credentials.json`)는 이와 **별개**로 실행 시 자동 갱신되므로
-> 다시 로그인할 필요가 없습니다.
+> kaggle CLI OAuth(`~/.kaggle/credentials.json`)는 이와 **별개**입니다. access token(수명 3시간)은
+> 실행 시 `refresh_token` 으로 자동 갱신되지만, `refresh_token` 까지 만료되어 갱신이 실패하면
+> `freecloud login kaggle` 로 다시 로그인해야 합니다.
 
 ## 상태 확인
 ```bash
 freecloud auth      # 모든 provider 인증 상태 + 저장된 시크릿 이름
+freecloud login     # (인자 없음) 같은 상태표 + 미인증인 것만 차례로 "지금 로그인할까요? [y/N]"
 ```
+
+인자 없는 `freecloud login` 은 미인증 provider 를 하나씩 묻습니다(kaggle-ui·colab 포함).
+비대화형(파이프·CI)에서는 표만 찍고 한 번도 묻지 않으며, 미인증이 있으면 종료코드 1 입니다.
+CLI·SDK 가 **설치되지 않은** provider 는 `··` 로 따로 표시하고(설치 명령 안내), 묻지도 않고
+종료코드에도 세지 않습니다 — 로그인으로 풀 수 있는 문제가 아니기 때문입니다.
 
 ---
 
@@ -75,11 +99,11 @@ freecloud auth      # 모든 provider 인증 상태 + 저장된 시크릿 이름
 
 | 경로 | 내용 |
 |---|---|
-| `~/.freecloud/secrets.json` | 등록한 토큰(HF 등) |
+| `~/.freecloud/secrets.json` | 등록한 토큰 — HF, Lightning 3종(API Key·User ID·Teamspace), Saturn, 비대화형으로 넣은 Kaggle 토큰 |
 | `~/.freecloud/kaggle_state.json`, `colab_state.json` | 브라우저 로그인 세션 |
 | `~/.freecloud/chrome_profile/` | kaggle-login 이 쓰는 실제 Chrome 프로필 |
 | `~/.freecloud/cooldown.json` | provider별 쿨다운 |
-| `~/.kaggle/credentials.json` | `kaggle auth login` 의 OAuth 토큰(fcc 가 자동 갱신) |
+| `~/.kaggle/credentials.json` | `freecloud login kaggle` 이 만드는 OAuth 토큰(fcc 가 자동 갱신) |
 | `./artifacts/<job.name>/` | 회수한 산출물(`FREECLOUD_ARTIFACTS_DIR` 로 변경) |
 
 ## 보안 원칙
@@ -93,6 +117,17 @@ freecloud auth      # 모든 provider 인증 상태 + 저장된 시크릿 이름
 - HF 토큰은 가능하면 **해당 체크포인트 repo로 스코프를 좁힌 fine-grained write 토큰** 권장.
 
 ## CI(무인)에서
-토큰 방식 provider만 GitHub Actions에서 완전 무인 동작합니다. 브라우저 방식(colab/kaggle-ui)은
+환경변수로 자격증명을 넘길 수 있는 provider만 GitHub Actions에서 완전 무인 동작합니다.
+env 가 저장소 파일보다 우선하므로, CI secret 을 아래 이름으로 넣으면 로그인 단계 없이 돕니다.
+
+| provider | 환경변수 |
+|---|---|
+| huggingface | `HF_TOKEN` |
+| kaggle | `KAGGLE_API_TOKEN` |
+| lightning | `LIGHTNING_API_KEY`, `LIGHTNING_USER_ID`, `LIGHTNING_TEAMSPACE` |
+| modal | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` — **env 로만** 동작(fcc 는 저장하지 않는다) |
+| saturn | `SATURN_TOKEN` |
+
+브라우저 쿠키 방식(colab/kaggle-ui)은
 저장된 `storage_state`를 CI secret으로 넣어야 하며 만료 관리가 필요 → 제한적.
 `.github/workflows/dispatch.example.yml` 참고.

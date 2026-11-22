@@ -37,7 +37,8 @@ class SaturnProvider(Provider):
         try:
             import saturn_client  # noqa: F401
         except ImportError:
-            return Probe(False, "saturn-client 미설치(pip install saturn-client).")
+            return Probe(False, "saturn-client 미설치(pip install saturn-client).",
+                         error_class="NOT_INSTALLED")
         from . import _saturn_token
         if not _saturn_token():
             return Probe(False, "SATURN_TOKEN 미설정(freecloud login saturn).")

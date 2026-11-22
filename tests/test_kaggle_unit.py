@@ -50,7 +50,7 @@ def test_probe_rejects_auth_failure(monkeypatch):
     monkeypatch.setattr(p, "_sh", lambda *a, **k: (1, "Authentication required to call the Kaggle API."))
     pr = p.probe()
     assert pr.available is False
-    assert "kaggle auth login" in pr.reason
+    assert "fcc login kaggle" in pr.reason
 
 
 def test_probe_ok_only_when_rc_zero(monkeypatch):
@@ -70,7 +70,7 @@ def test_probe_missing_cli(monkeypatch):
 
 def test_auth_hint_classifies():
     from freecloud.providers.kaggle import kaggle_auth_hint
-    assert "auth login" in kaggle_auth_hint("Authentication required")
+    assert "fcc login kaggle" in kaggle_auth_hint("Authentication required")
     assert "403" in kaggle_auth_hint("HTTP 403 Forbidden")
     assert "429" in kaggle_auth_hint("429 Too Many Requests")
     assert "원인 불명" in kaggle_auth_hint("")

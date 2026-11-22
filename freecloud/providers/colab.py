@@ -40,7 +40,8 @@ class ColabProvider(Provider):
         """
         rc, log = self._sh(self._cmd("sessions"), 60)
         if rc == 127:
-            return Probe(False, "colab CLI 미설치/미가용(WSL 필요할 수 있음).")
+            return Probe(False, "colab CLI 미설치/미가용(WSL 필요할 수 있음).",
+                         error_class="NOT_INSTALLED")
         if rc == 124:
             return Probe(False, "colab sessions 응답 없음(60s 초과).", cooldown_s=300)
         if rc != 0:

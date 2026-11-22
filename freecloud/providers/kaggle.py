@@ -257,35 +257,64 @@ class KaggleProvider(Provider):
 
     # ── 공용 헬퍼(kaggle-ui가 재사용) ────────────────────────────────────────
     def _sh(self, cmd, timeout, env=None, cwd=None):
-        """kaggle CLI 호출 전 OAuth 토큰을 환경변수로 주입한다.
+        """kaggle CLI 호출 전 토큰을 KAGGLE_API_TOKEN 으로 주입한다.
 
-        `kaggle auth login`(OAuth)은 ~/.kaggle/credentials.json 을 만들지만
-        **CLI 2.2.x 가 이 파일을 kernels 계열 명령에서 자동으로 읽지 않는다**
-        (2026-08-21 실측: 로그인 직후에도 "Authentication required").
-        같은 파일의 access_token 을 KAGGLE_API_TOKEN 으로 넣어주면 즉시 통과한다.
-        → 사용자에게 수동 export 를 요구하지 않고 여기서 메운다.
+        주입 순서(고정): **env > OAuth(credentials.json, 자동 갱신) > secrets.json 의 KAGGLE_API_TOKEN.**
+        순서를 뒤집으면 낡은 저장 토큰이 방금 한 OAuth 로그인을 가린다.
+
+        왜 주입하나: CLI 는 credentials.json 을 스스로 읽는다(실측: 임시 HOME 에 credentials.json
+        만 두면 rc=0). 그런데 **낡은 kaggle.json 이 같이 있으면 OAuth 를 가린다**(legacy 가 인증
+        순서상 앞 — 같은 조건에 kaggle.json 을 더하면 rc=1 "Authentication required").
+        env 토큰은 그 둘보다 앞이라, 여기서 넣어 주면 낡은 파일이 남아 있어도 통과한다.
+        (예전 주석의 "CLI 가 credentials.json 을 자동으로 안 읽는다"는 오진이었다.)
         """
         merged = dict(env or {})
-        if cmd and cmd[0] == "kaggle" and not os.environ.get("KAGGLE_API_TOKEN"):
+        if (cmd and cmd[0] == "kaggle" and not merged.get("KAGGLE_API_TOKEN")
+                and not os.environ.get("KAGGLE_API_TOKEN")):
             tok = oauth_access_token()
+            if not tok:
+                from .. import secrets
+                tok = secrets.get("KAGGLE_API_TOKEN") or ""
             if tok:
                 merged["KAGGLE_API_TOKEN"] = tok
         return super()._sh(cmd, timeout, merged, cwd)
 
     def _user(self) -> str:
+        """계정 이름. 순서: env → credentials.json → `kaggle config view` → kaggle.json.
+
+        토큰만 있는 경우(저장 토큰·KAGGLE_API_TOKEN)에는 파일에 username 이 없다. 그 값은
+        토큰에서 유도되므로 사용자에게 또 묻지 않고 CLI 에 물어본다(인스턴스당 1회, 캐시).
+        """
         if os.environ.get("KAGGLE_USERNAME"):
             return os.environ["KAGGLE_USERNAME"]
-        for path, key in ((("~/.kaggle/credentials.json"), "username"),
-                          (("~/.kaggle/kaggle.json"), "username")):
-            fp = os.path.expanduser(path)
-            if os.path.exists(fp):
-                try:
-                    v = json.load(open(fp)).get(key, "")
-                    if v:
-                        return v
-                except Exception:
-                    pass
+        return (self._user_from_file("~/.kaggle/credentials.json")
+                or self._user_from_cli()
+                or self._user_from_file("~/.kaggle/kaggle.json"))
+
+    @staticmethod
+    def _user_from_file(path: str) -> str:
+        fp = os.path.expanduser(path)
+        if os.path.exists(fp):
+            try:
+                return str(json.load(open(fp)).get("username", "") or "")
+            except Exception:
+                pass
         return ""
+
+    def _user_from_cli(self) -> str:
+        cached = getattr(self, "_cli_user", None)
+        if cached is None:
+            cached = ""
+            try:
+                rc, out = self._sh(["kaggle", "config", "view"], 30, _UTF8)
+                if rc == 0:
+                    m = re.search(r"^\s*-\s*username:\s*(\S+)\s*$", out or "", re.M)
+                    if m and m.group(1).lower() != "none":
+                        cached = m.group(1)
+            except Exception:
+                pass
+            self._cli_user = cached
+        return cached
 
     def kernel_slug(self, job: Job) -> str:
         return f"freecloud-{job.name}".lower().replace("_", "-")[:50]
@@ -756,16 +785,20 @@ class KaggleProvider(Provider):
                          error_class="TIMEOUT")
 
     # ── 인터페이스 ───────────────────────────────────────────────────────────
-    def probe(self) -> Probe:
-        """실제 API 호출 결과까지 본다.
+    def probe(self, token: "str | None" = None) -> Probe:
+        """실제 API 호출 결과까지 본다. `token` 을 주면 그 값을 주입해 검증한다(로그인 검증용).
 
         ⚠️ 과거 버그: rc==127(CLI 부재)만 검사하고 rc!=0(인증 실패)은 그냥 통과시켜
         `fcc auth` 가 "kaggle 인증 OK" 라 답한 뒤 `fcc run` 이 AUTH 로 죽었다.
         probe 는 '붙는다'를 보장해야 의미가 있다 — 거짓 양성은 없느니만 못하다.
         """
-        rc, log = self._sh(["kaggle", "kernels", "list", "-m", "--page-size", "1"], 60, _UTF8)
+        env = dict(_UTF8)
+        if token:
+            env["KAGGLE_API_TOKEN"] = token
+        rc, log = self._sh(["kaggle", "kernels", "list", "-m", "--page-size", "1"], 60, env)
         if rc == 127:
-            return Probe(False, "kaggle CLI 미설치(pip install kaggle).")
+            return Probe(False, "kaggle CLI 미설치(pip install kaggle).",
+                         error_class="NOT_INSTALLED")
         if rc == 0:
             return Probe(True, f"kaggle 인증 OK{(' (' + self._user() + ')') if self._user() else ''}.")
         return Probe(False, kaggle_auth_hint(log))
@@ -956,11 +989,11 @@ def oauth_access_token() -> str:
         token, exp = _refresh_via_sdk(rt)
     except Exception as e:
         print(f"[kaggle] access token 갱신 실패({type(e).__name__}) — "
-              f"`kaggle auth login --force` 로 재로그인하라.", flush=True)
+              f"`fcc login kaggle` 로 재로그인하라.", flush=True)
         return ""
     if not token:
         print("[kaggle] access token 갱신 실패(빈 토큰) — "
-              "`kaggle auth login --force` 로 재로그인하라.", flush=True)
+              "`fcc login kaggle` 로 재로그인하라.", flush=True)
         return ""
 
     d["access_token"] = token
@@ -979,17 +1012,23 @@ def oauth_access_token() -> str:
 def kaggle_auth_hint(log: str) -> str:
     """kaggle CLI 실패 로그 → 사람이 바로 실행할 수 있는 한 줄 안내.
 
-    kaggle CLI 2.2.x 부터 인증 방식이 바뀌었다. 예전 `~/.kaggle/kaggle.json`
-    (username+key)만 있으면 되던 것이 이제 OAuth 또는 단일 API 토큰을 요구하고,
-    kaggle.json 이 있어도 "Authentication required" 로 거절한다.
-    실측(2026-08-21): kaggle.json·access_token 이 둘 다 있는데도 거절 → 재로그인 필요.
+    흔한 원인: **낡은 `~/.kaggle/kaggle.json` 이 OAuth 인증을 가린다**(legacy 가 인증 순서상
+    앞). 실측: 임시 HOME 에 credentials.json 만 두면 rc=0, 낡은 kaggle.json 을 더하면 rc=1
+    "Authentication required". 완결 경로는 `fcc login kaggle`(낡은 파일을 .bak 으로 치우고
+    OAuth 재로그인 → probe 로 판정). 예전 주석의 "CLI 2.2+ 는 kaggle.json 만으로는 통과하지
+    않는다"는 원인을 틀리게 짚은 것이었다.
     """
     low = (log or "").lower()
     if "authentication required" in low or "401" in low or "unauthorized" in low:
-        return ("kaggle 인증 만료/불일치 — `kaggle auth login`(브라우저 OAuth) 으로 재로그인하라. "
+        hint = ("kaggle 인증 만료/불일치 — `fcc login kaggle`(브라우저 OAuth) 로 재로그인하라. "
                 "비대화형이면 kaggle.com/settings/api 에서 새 토큰을 받아 "
-                "KAGGLE_API_TOKEN 환경변수 또는 ~/.kaggle/access_token 에 넣는다. "
-                "※ CLI 2.2+ 는 예전 kaggle.json(username+key)만으로는 통과하지 않는다.")
+                "`KAGGLE_API_TOKEN=... fcc login kaggle`. "
+                "※ 낡은 ~/.kaggle/kaggle.json 이 OAuth 인증을 가린다 — "
+                "`fcc login kaggle` 이 .bak 으로 치워준다.")
+        if os.environ.get("KAGGLE_API_TOKEN"):
+            hint += (" ※ 환경변수 KAGGLE_API_TOKEN 값이 우선 쓰입니다 — 낡았으면 "
+                     "unset 하세요.")
+        return hint
     if "403" in low or "forbidden" in low:
         return "kaggle 권한 거부(403) — 계정 상태/전화 인증(Phone verification) 확인 필요."
     if "429" in low or "too many requests" in low:

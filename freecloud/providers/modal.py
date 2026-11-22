@@ -20,11 +20,14 @@ class ModalProvider(Provider):
                     "note": "무료 크레딧 소진 시 페일오버."}
 
     def probe(self) -> Probe:
-        rc, log = self._sh(["modal", "token", "current"], 30)
+        # `token info` 로 본다. 예전의 `token current` 는 modal 1.5.x 에 없는 하위명령이라
+        # 로그인돼 있어도 rc=2 → "토큰 미설정" 거짓 음성이었다(실측 modal 1.5.3).
+        rc, log = self._sh(["modal", "token", "info"], 30)
         if rc == 127:
-            return Probe(False, "modal CLI 미설치(pip install modal).")
+            return Probe(False, "modal CLI 미설치(pip install modal).",
+                         error_class="NOT_INSTALLED")
         if rc != 0:
-            return Probe(False, "modal 토큰 미설정(modal token new).")
+            return Probe(False, "modal 토큰 미설정/무효(fcc login modal).")
         return Probe(True, "modal 인증 OK.")
 
     def run(self, job: Job) -> RunResult:
