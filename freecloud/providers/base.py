@@ -135,5 +135,11 @@ class Provider(ABC):
         except FileNotFoundError:
             return 127, f"명령 없음: {cmd[0]} (해당 provider CLI 미설치)"
         except subprocess.TimeoutExpired as e:
-            out = (e.stdout or "") + (e.stderr or "") if hasattr(e, "stdout") else ""
+            def _txt(v):   # TimeoutExpired 는 text=True 여도 stdout/stderr 가 bytes 일 수 있음 → str 로 안전 변환
+                if v is None:
+                    return ""
+                if isinstance(v, (bytes, bytearray)):
+                    return v.decode("utf-8", "replace")
+                return str(v)
+            out = _txt(getattr(e, "stdout", None)) + _txt(getattr(e, "stderr", None))
             return 124, out + f"\n[timeout {timeout}s] {cmd[0]}"
