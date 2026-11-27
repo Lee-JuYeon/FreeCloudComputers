@@ -154,7 +154,8 @@ def test_job_load_abspaths_explicit_workdir(tmp_path):
 def test_kernel_script_with_workdir_copies_and_cds():
     src = _build_kernel_script("python train.py", {}, "freecloud-wd-workdir")
     compile(src, "<kernel>", "exec")                 # SyntaxError 면 실패
-    assert "/kaggle/input/freecloud-wd-workdir" in src
+    assert "_name = 'freecloud-wd-workdir'" in src
+    assert "/kaggle/input/" in src
     assert "_dst = '/kaggle/working/workdir'" in src
     assert "os.chdir(_dst)" in src
     assert "os.environ['FREECLOUD_WORKDIR'] = _dst" in src
@@ -234,7 +235,7 @@ def test_stage_creates_private_dataset_and_wires_sources(tmp_path, monkeypatch):
     assert kmeta["dataset_sources"] == ["someone/freecloud-wd-workdir"]
     assert kmeta["is_private"] is True
     src = open(os.path.join(work, "kernel.py"), encoding="utf-8").read()
-    assert "/kaggle/input/freecloud-wd-workdir" in src
+    assert "_name = 'freecloud-wd-workdir'" in src
 
 
 def test_stage_falls_back_to_version_when_dataset_exists(tmp_path, monkeypatch):
@@ -333,3 +334,36 @@ def test_kaggle_ui_reuses_parent_staging(tmp_path, monkeypatch):
     assert err is None
     kmeta = json.load(open(os.path.join(work, "kernel-metadata.json")))
     assert kmeta["dataset_sources"] == ["someone/freecloud-wd-workdir"]
+
+
+def _run_stage(src: str, root: str) -> None:
+    """커널 스크립트의 workdir 스테이지 블록만 떼어, /kaggle 을 root 로 바꿔 실제 실행한다."""
+    lines = src.splitlines()
+    i0 = next(i for i, l in enumerate(lines) if "import shutil, glob, zipfile" in l)
+    i1 = next(i for i, l in enumerate(lines) if "os.chdir(_dst)" in l)
+    code = "\n".join(l[4:] for l in lines[i0:i1])     # chdir 는 빼고(테스트 cwd 보존)
+    code = code.replace("/kaggle/input", root + "/input").replace(
+        "/kaggle/working/workdir", root + "/wd")
+    exec(code, {"os": os})
+
+
+@pytest.mark.parametrize("layout", [
+    "freecloud-wd-workdir",                      # 옛 마운트(~2026-10)
+    "datasets/someone/freecloud-wd-workdir",     # 새 마운트(2026-11-28 실측)
+])
+def test_kernel_stage_finds_dataset_in_old_and_new_mount_layout(tmp_path, layout):
+    """Kaggle 마운트 경로는 고정값이 아니다 — 옛/새 배치 모두에서 workdir 가 풀려야 한다."""
+    d = tmp_path / "input" / layout / "pkg"
+    d.mkdir(parents=True)
+    (d / "a.py").write_text("x")
+    _run_stage(_build_kernel_script("python train.py", {}, "freecloud-wd-workdir"), str(tmp_path))
+    assert (tmp_path / "wd" / "pkg" / "a.py").read_text() == "x"
+
+
+def test_kernel_stage_unmounted_dataset_fails_with_listing(tmp_path):
+    """안 붙었으면 조용히 넘어가지 않고, /kaggle/input 에 실제로 뭐가 있는지 적어 죽는다."""
+    (tmp_path / "input" / "datasets" / "someone" / "other").mkdir(parents=True)
+    with pytest.raises(FileNotFoundError) as ei:
+        _run_stage(_build_kernel_script("python train.py", {}, "freecloud-wd-workdir"),
+                   str(tmp_path))
+    assert "not mounted" in str(ei.value) and "datasets" in str(ei.value)

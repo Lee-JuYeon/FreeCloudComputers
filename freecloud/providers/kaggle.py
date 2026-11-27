@@ -1049,7 +1049,16 @@ def _build_kernel_script(entrypoint: str, env: dict, workdir_title: str | None =
     if workdir_title:
         stage = (
             "    import shutil, glob, zipfile\n"
-            "    _src = '/kaggle/input/%s'\n" % workdir_title +
+            # 마운트 경로는 **고정값이 아니다** — Kaggle 이 2026-11 에 /kaggle/input/<slug> 를
+            # /kaggle/input/datasets/<owner>/<slug> 로 바꿔 옛 경로 하드코딩이 FileNotFoundError
+            # 로 죽었다(2026-11-28 실측). 옛 경로를 먼저 보고, 없으면 slug 로 찾는다.
+            "    _name = '%s'\n" % workdir_title +
+            "    _cands = ['/kaggle/input/' + _name] + sorted(\n"
+            "        glob.glob('/kaggle/input/*/' + _name) + glob.glob('/kaggle/input/*/*/' + _name))\n"
+            "    _src = next((c for c in _cands if os.path.isdir(c)), None)\n"
+            "    if _src is None:\n"
+            "        raise FileNotFoundError('workdir dataset ' + _name + ' not mounted under /kaggle/input: '\n"
+            "                                + repr(sorted(glob.glob('/kaggle/input/*') + glob.glob('/kaggle/input/*/*'))))\n" +
             "    _dst = %r\n" % REMOTE_WORKDIR +
             "    shutil.copytree(_src, _dst, dirs_exist_ok=True)\n"
             "    for _z in sorted(glob.glob(_dst + '/*.zip')):\n"
